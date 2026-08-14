@@ -1,9 +1,15 @@
-use axum::extract::Multipart;
+use axum::extract::{Multipart, Query};
 use axum::http::StatusCode;
-use crate::json_converter;
+use crate::{json_converter, train_params};
 use crate::learning_without_feature_scaling::WithoutFeatureScaling;
 
-pub async fn train(mut multipart: Multipart) -> Result<String, (StatusCode, String)> {
+pub async fn train(
+    Query(params) : Query<train_params::TrainParams>,
+    mut multipart: Multipart
+) -> Result<String, (StatusCode, String)> {
+
+    params.validate().map_err(|e| (e.0, e.1))?;
+
     let mut payload: Option<String> = None;
 
     while let Some(field) = multipart.next_field().await
@@ -28,9 +34,8 @@ pub async fn train(mut multipart: Multipart) -> Result<String, (StatusCode, Stri
         inputs, outputs, vec![0.0; n + 1]
     );
 
-    // FixMe : I have will gotten user learning rate and loop count
     let (last_coefficients, J_before_learning, J_after_learning) : (Vec<f64>, f64, f64)
-        = without_feature_scaling.train_model(0.000003, 1_000_000);
+        = without_feature_scaling.train_model(params.learning_rate, params.loop_count);
 
     json_converter::coefficients_to_json(&last_coefficients, J_before_learning, J_after_learning)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
