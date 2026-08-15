@@ -33,7 +33,7 @@ USER app
 
 COPY --from=builder \
      /app/target/release/learn_model_with_linear_regression_api \
-     /usr/local/bin/learn-model-api
+     /usr/local/bin/linear-regression-api
 
 # main.rs binds 0.0.0.0:3000 unconditionally; the port is not configurable from
 # outside, so publish it with -p on the host side instead.
