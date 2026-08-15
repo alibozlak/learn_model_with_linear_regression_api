@@ -41,6 +41,9 @@ being written back.
 - Rust (edition 2024)
 - No system dependencies
 
+Docker alone is enough if you would rather not install a toolchain — see
+[Docker](#docker) below.
+
 ## Running
 
 ```bash
@@ -51,15 +54,52 @@ The server binds `0.0.0.0:3000` and prints the address it is listening on. Use
 `cargo run --release` for anything larger than a toy data set — the training loop is
 roughly two orders of magnitude faster with optimisations on.
 
+## Docker
+
+A multi-stage `Dockerfile` is included, so building and running takes nothing but
+Docker itself:
+
+```bash
+docker build -t linear-regression-api .
+```
+
+```bash
+docker run --rm -p 3000:3000 linear-regression-api
+```
+
+The image is always the optimised build, so the `--release` caveat above does not
+apply to it.
+
+How it is put together, and why:
+
+- **Two stages.** `rust:1.95-slim-bookworm` compiles and `debian:bookworm-slim` runs.
+  Only the binary crosses between them, which lands the result at roughly 77 MB
+  rather than the gigabyte-and-a-half the toolchain image weighs. Both stages sit on
+  the same Debian release, so the binary meets the glibc it was linked against.
+- **Dependencies are cached on a layer of their own.** The manifests are copied and
+  built against a placeholder `main.rs` before the real sources arrive, so editing
+  `src/` recompiles this crate alone and leaves axum, tokio and everything under them
+  untouched.
+- **It runs as an unprivileged user** (`app`, uid 999). The server opens no files and
+  binds an unprivileged port, so there is nothing for root to do.
+- **The port is fixed at 3000 inside the container**, because `main.rs` binds
+  `0.0.0.0:3000` unconditionally — there is no environment variable to change it.
+  Remap it from the host instead if that port is taken: `-p 8080:3000`.
+
+`.dockerignore` keeps `target/` out of the build context. It grows to a few hundred
+megabytes as soon as the project is built locally, and every byte would otherwise be
+handed to the daemon on each build.
+
 ## API
 
 ### `POST /train`
 
-Trains a fresh model on the data set in the request body and returns the
-coefficients it converged to. Each request starts from all-zero coefficients; the
-server keeps no state between requests.
+Trains a fresh model on the data set in the request and returns the coefficients it
+converged to. Each request starts from all-zero coefficients; the server keeps no
+state between requests.
 
-**Request body** — raw JSON. `inputs[i]` is one sample's feature values, and
+**Request** — `multipart/form-data` carrying a single field named `dataset`, whose
+content is the training set as JSON. `inputs[i]` is one sample's feature values, and
 `outputs[i]` is that sample's expected value:
 
 ```json
@@ -79,6 +119,17 @@ server keeps no state between requests.
 Every sample must carry the same number of features. The feature count `n` is read
 from the first sample.
 
+**Query parameters** — both optional, both checked before any training starts:
+
+| Parameter | Default | Accepted | Meaning |
+| --- | --- | --- | --- |
+| `learning_rate` | `0.000003` | finite and `> 0` | Step size of each gradient descent update |
+| `loop_count` | `1000000` | `1` to `5000000` | How many iterations to run |
+
+The defaults are values this kind of data set converges under. Because the features
+are unscaled, a learning rate even one order of magnitude larger diverges — see the
+note under [Known limitations](#known-limitations).
+
 **Response** — `200 OK`, single-line JSON:
 
 ```json
@@ -94,42 +145,56 @@ whether the learning rate was sane.
 
 | Status | Body | Cause |
 | --- | --- | --- |
-| `400` | `invalid JSON payload: ...` | Body is not valid JSON, or does not match the expected shape |
+| `400` | ``Invalid `boundary` for `multipart/form-data` request`` | The body was not sent as multipart — e.g. raw JSON via `--data-binary` |
+| `400` | `Form hasn't a 'dataset' named field !!` | Multipart body carries no field called `dataset` |
+| `400` | `Failed to deserialize query string: ...` | A query parameter is not of the expected type, e.g. `loop_count=abc` |
+| `400` | `learning_rate must be a finite number greater than 0, got X` | `learning_rate` is zero, negative, `NaN` or infinite |
+| `400` | `loop_count must be at least 1` | `loop_count` is `0` |
+| `400` | `loop_count must not exceed 5000000, got X` | `loop_count` is above the cap |
+| `400` | `invalid JSON payload: ...` | The field is not valid JSON, or does not match the expected shape |
 | `400` | `"inputs" is empty, there is nothing to train on` | `inputs` is `[]` |
 | `400` | `sample count mismatch: N input sample(s) but M output(s)` | `inputs` and `outputs` differ in length |
 | `400` | `sample K has F feature(s) while the first sample has E` | Rows of differing width |
+| `400` | ``Error parsing `multipart/form-data` request`` | The multipart body is malformed, or the request went over the 32 MB body limit |
 | `500` | serialisation error | The result could not be encoded |
 
 ## Usage with curl
 
-Send a data set held in a file. `--data-binary` matters — plain `-d` strips newlines
-and can mangle the payload:
+Send a data set held in a file. `-F` is what makes curl build the multipart body and
+set the `Content-Type` boundary along with it; the `@` tells it to read a file rather
+than take the text literally:
 
 ```bash
-curl -X POST --data-binary @dataset.json http://localhost:3000/train
+curl -X POST -F "dataset=@dataset.json" http://localhost:3000/train
 ```
 
-Inline, for a quick check:
+Inline, for a quick check — no `@` this time, so the JSON is used as the value:
 
 ```bash
-curl -X POST --data-binary '{"inputs":[[55.0,1.0],[130.0,4.0]],"outputs":[23000.0,48500.0]}' http://localhost:3000/train
+curl -X POST -F 'dataset={"inputs":[[55.0,1.0],[130.0,4.0]],"outputs":[23000.0,48500.0]}' http://localhost:3000/train
 ```
 
-No `Content-Type` header is needed: the handler takes the body as a raw string and
-parses it itself, so curl's default header is not rejected.
+Override either hyperparameter from the query string. Quote the URL, otherwise the
+shell swallows everything from the `&` onwards:
+
+```bash
+curl -X POST -F "dataset=@dataset.json" "http://localhost:3000/train?learning_rate=0.000001&loop_count=2000000"
+```
 
 Pretty-print the response by piping through `jq`:
 
 ```bash
-curl -s -X POST --data-binary @dataset.json http://localhost:3000/train | jq
+curl -s -X POST -F "dataset=@dataset.json" http://localhost:3000/train | jq
 ```
 
 ## Layout
 
 ```text
 src/
-├── main.rs                            HTTP layer: routing, handler, server bootstrap
-├── json_converter.rs                  JSON <-> the model's vectors, plus validation
+├── main.rs                               Router, body limit, server bootstrap
+├── train_endpoint.rs                     The POST /train handler
+├── train_params.rs                       Query parameters and their validation
+├── json_converter.rs                     JSON <-> the model's vectors, plus validation
 └── learning_without_feature_scaling.rs   The model: hypothesis, cost, gradients, descent
 ```
 
@@ -143,16 +208,20 @@ trigger the panics that constructor documents.
 These are either deliberate or on the roadmap — listed so nobody has to rediscover
 them.
 
-- **Hyperparameters are hardcoded.** The learning rate (`0.000003`) and iteration
-  count (`1_000_000`) live in the handler. Both should come from the request.
 - **No divergence guard.** If the learning rate is too large for the data's scale,
   the coefficients overflow to `NaN`. `serde_json` writes non-finite floats as
   `null`, so the endpoint answers `200 OK` with
-  `{"last_coefficients":[null,null,null], ...}`. Compare `J_after_learning` against
-  `J_before_learning` to catch this until it is handled server-side.
-- **Request bodies are capped at 2 MB** by axum's default body limit. Larger data
-  sets are rejected with `413 Payload Too Large`; raising it needs a
-  `DefaultBodyLimit` layer.
+  `{"last_coefficients":[null,null,null], ...}` — `learning_rate=0.1` on the sample
+  data set above is already enough to trigger it. The range check on `learning_rate`
+  only rejects values that are not positive and finite; it cannot know what is too
+  large for a given data set. Compare `J_after_learning` against `J_before_learning`
+  to catch this until it is handled server-side.
+- **Request bodies are capped at 32 MB** by the `DefaultBodyLimit` layer in
+  `main.rs`, and going over does not surface as `413 Payload Too Large`. The limit
+  makes the body stream fail part-way, and the multipart extractor reports that as a
+  plain `400` with `Error parsing multipart/form-data request` — the very message a
+  genuinely malformed body produces, so a client cannot tell the two apart. Reading
+  the field with a size check of its own would be needed to answer `413` properly.
 - **Training blocks an async worker thread.** The descent is synchronous CPU work
   running directly in the handler; it belongs in `tokio::task::spawn_blocking`.
 - **The gradient loop recomputes predictions per parameter.** `dJ/da_j` calls the
