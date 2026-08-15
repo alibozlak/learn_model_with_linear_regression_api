@@ -5,8 +5,9 @@ use serde::Deserialize;
 pub struct TrainParams {
     #[serde(default = "default_learning_rate")]
     pub learning_rate: f64,
+
     #[serde(default = "default_loop_count")]
-    pub loop_count: usize,
+    pub loop_count: usize
 }
 
 fn default_learning_rate() -> f64 { 0.000003 }

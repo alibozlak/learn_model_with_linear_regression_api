@@ -26,12 +26,16 @@ pub async fn train(
         "Form hasn't a 'dataset' named field !!".to_string(),
     ))?;
 
-    let (inputs, outputs) = json_converter::training_data_from_json(&json_real_datas)
+    let (inputs, outputs, initial_coefficients) 
+        = json_converter::training_data_from_json(&json_real_datas)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let n : usize = inputs[0].len();
 
+    let mut initial_coefficients : Vec<f64> = initial_coefficients;
+    if initial_coefficients.len() == 2 { initial_coefficients = vec![0.0; n+1] }
+
     let mut without_feature_scaling = WithoutFeatureScaling::new(
-        inputs, outputs, vec![0.0; n + 1]
+        inputs, outputs, initial_coefficients
     );
 
     let (last_coefficients, J_before_learning, J_after_learning) : (Vec<f64>, f64, f64)

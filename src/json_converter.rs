@@ -36,8 +36,11 @@ use serde::{Deserialize, Serialize};
 pub struct TrainingData {
     /// One entry per sample, each holding that sample's `n` feature values.
     pub inputs : Vec<Vec<f64>>,
+
     /// The expected output of the sample at the same index in [`Self::inputs`].
-    pub outputs : Vec<f64>
+    pub outputs : Vec<f64>,
+
+    pub initial_coefficients : Vec<f64>
 }
 
 /// The outcome of a training run, serialised as
@@ -62,13 +65,18 @@ pub struct TrainingResult {
 pub enum JsonConverterError {
     /// The text was not valid JSON, or did not match the expected shape.
     Json(serde_json::Error),
+
     /// `inputs` was empty: there is nothing to train on, and no feature count
     /// can be derived.
     EmptyDataSet,
+
     /// There are not as many outputs as there are input samples.
     SampleCountMismatch { inputs : usize, outputs : usize },
+
     /// One sample carries a different number of features than the first one.
-    RaggedSample { index : usize, expected : usize, found : usize }
+    RaggedSample { index : usize, expected : usize, found : usize },
+
+    InitialCoefficientsCountMismatch
 }
 
 impl fmt::Display for JsonConverterError {
@@ -83,6 +91,9 @@ impl fmt::Display for JsonConverterError {
             Self::RaggedSample { index, expected, found } => write!(
                 f,
                 "sample {index} has {found} feature(s) while the first sample has {expected}"
+            ),
+            Self::InitialCoefficientsCountMismatch => write!(
+                f, "\"initial_coefficients count\" - 1 is not equal to feature count !!"
             )
         }
     }
@@ -116,11 +127,11 @@ impl From<serde_json::Error> for JsonConverterError {
 /// ```
 pub fn training_data_from_json(
     json : &str
-) -> Result<(Vec<Vec<f64>>, Vec<f64>), JsonConverterError> {
+) -> Result<(Vec<Vec<f64>>, Vec<f64>, Vec<f64>), JsonConverterError> {
     let data : TrainingData = serde_json::from_str(json)?;
     validate(&data)?;
 
-    Ok((data.inputs, data.outputs))
+    Ok((data.inputs, data.outputs, data.initial_coefficients))
 }
 
 /// Serialises the coefficients a training run ended with into a single JSON
@@ -184,6 +195,10 @@ fn validate(data : &TrainingData) -> Result<(), JsonConverterError> {
                 found : sample.len()
             });
         }
+    }
+
+    if n + 1 != data.initial_coefficients.len() {
+        return Err(JsonConverterError::InitialCoefficientsCountMismatch);
     }
 
     Ok(())
