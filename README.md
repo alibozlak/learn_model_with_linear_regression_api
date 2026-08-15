@@ -94,13 +94,14 @@ handed to the daemon on each build.
 
 ### `POST /train`
 
-Trains a fresh model on the data set in the request and returns the coefficients it
-converged to. Each request starts from all-zero coefficients; the server keeps no
-state between requests.
+Trains a model on the data set in the request and returns the coefficients it
+converged to. The server keeps no state between requests — the point the descent
+starts from arrives with the request, as `initial_coefficients`.
 
 **Request** — `multipart/form-data` carrying a single field named `dataset`, whose
-content is the training set as JSON. `inputs[i]` is one sample's feature values, and
-`outputs[i]` is that sample's expected value:
+content is the training set as JSON. `inputs[i]` is one sample's feature values,
+`outputs[i]` is that sample's expected value, and `initial_coefficients` is where
+gradient descent begins:
 
 ```json
 {
@@ -112,12 +113,36 @@ content is the training set as JSON. `inputs[i]` is one sample's feature values,
     [130.0, 4.0],
     [165.0, 5.0]
   ],
-  "outputs": [23000.0, 30500.0, 38000.0, 44000.0, 48500.0, 61000.0]
+  "outputs": [23000.0, 30500.0, 38000.0, 44000.0, 48500.0, 61000.0],
+  "initial_coefficients": [0.0, 0.0, 0.0]
 }
 ```
 
 Every sample must carry the same number of features. The feature count `n` is read
 from the first sample.
+
+`initial_coefficients` is **required** — leaving it out is a `400`, not a fall back
+to zeros. It is laid out as `[a_1, ..., a_n, b]` with the bias last, so it must be
+exactly `n + 1` long: three entries for the two-feature set above.
+
+**Not wanting to choose a starting point still means sending the field**, filled with
+`n + 1` zeros. There is no shorter stand-in and no value that means "decide for me" —
+a zero vector of some other length is rejected by the length check exactly like any
+other wrong length, so the number of zeros has to follow `n`:
+
+| Features `n` | Send as `initial_coefficients` |
+| --- | --- |
+| 1 | `[0.0, 0.0]` |
+| 2 | `[0.0, 0.0, 0.0]` |
+| 3 | `[0.0, 0.0, 0.0, 0.0]` |
+
+`[0.0, 0.0]` against a two-feature set is a `400`, not a request to start from the
+origin — the two zeros are one short of the three that set needs.
+
+That layout is deliberately the same one `last_coefficients` comes back in, which is
+what makes a run resumable: feed a previous response's coefficients back in and the
+descent picks up where it stopped. Splitting a run in two this way reaches exactly the
+coefficients the undivided run would have — see [Resuming a run](#resuming-a-run).
 
 **Query parameters** — both optional, both checked before any training starts:
 
@@ -133,13 +158,15 @@ note under [Known limitations](#known-limitations).
 **Response** — `200 OK`, single-line JSON:
 
 ```json
-{"last_coefficients":[375.13,-195.00,1807.28],"J_before_learning":1543200000.0,"J_after_learning":2847361.5}
+{"last_coefficients":[386.94817672821796,-210.66512190655385,764.9043122781602],"J_before_learning":1818750000.0,"J_after_learning":4516124.886161309}
 ```
 
 `last_coefficients` is laid out as `[a_1, ..., a_n, b]` — the bias occupies the last
-slot, so the array is `n + 1` long. `J_before_learning` and `J_after_learning` are
-the cost before and after the run; comparing them is the quickest way to tell
-whether the learning rate was sane.
+slot, so the array is `n + 1` long, and it is accepted verbatim as the next request's
+`initial_coefficients`. `J_before_learning` and `J_after_learning` are the cost before
+and after the run; comparing them is the quickest way to tell whether the learning
+rate was sane. Note that `J_before_learning` is the cost of the coefficients that were
+*sent in*, so it is only the cost at the origin when zeros were sent.
 
 **Errors** — `4xx`/`5xx` with a plain-text body describing the problem:
 
@@ -152,9 +179,11 @@ whether the learning rate was sane.
 | `400` | `loop_count must be at least 1` | `loop_count` is `0` |
 | `400` | `loop_count must not exceed 5000000, got X` | `loop_count` is above the cap |
 | `400` | `invalid JSON payload: ...` | The field is not valid JSON, or does not match the expected shape |
+| `400` | ``invalid JSON payload: missing field `initial_coefficients` at ...`` | The payload carries no `initial_coefficients` at all |
 | `400` | `"inputs" is empty, there is nothing to train on` | `inputs` is `[]` |
 | `400` | `sample count mismatch: N input sample(s) but M output(s)` | `inputs` and `outputs` differ in length |
 | `400` | `sample K has F feature(s) while the first sample has E` | Rows of differing width |
+| `400` | `"initial_coefficients count" - 1 is not equal to feature count !!` | `initial_coefficients` is not `n + 1` long — `[]`, and a zero vector too short for the set, included |
 | `400` | ``Error parsing `multipart/form-data` request`` | The multipart body is malformed, or the request went over the 32 MB body limit |
 | `500` | serialisation error | The result could not be encoded |
 
@@ -168,10 +197,11 @@ than take the text literally:
 curl -X POST -F "dataset=@dataset.json" http://localhost:3000/train
 ```
 
-Inline, for a quick check — no `@` this time, so the JSON is used as the value:
+Inline, for a quick check — no `@` this time, so the JSON is used as the value.
+`initial_coefficients` has to be there even when it is all zeros:
 
 ```bash
-curl -X POST -F 'dataset={"inputs":[[55.0,1.0],[130.0,4.0]],"outputs":[23000.0,48500.0]}' http://localhost:3000/train
+curl -X POST -F 'dataset={"inputs":[[55.0,1.0],[130.0,4.0]],"outputs":[23000.0,48500.0],"initial_coefficients":[0.0,0.0,0.0]}' http://localhost:3000/train
 ```
 
 Override either hyperparameter from the query string. Quote the URL, otherwise the
@@ -187,6 +217,34 @@ Pretty-print the response by piping through `jq`:
 curl -s -X POST -F "dataset=@dataset.json" http://localhost:3000/train | jq
 ```
 
+### Resuming a run
+
+Because `last_coefficients` comes back in the layout `initial_coefficients` expects,
+`jq` can splice one run's answer into the next request's payload:
+
+```bash
+curl -s -X POST -F "dataset=@dataset.json" "http://localhost:3000/train?loop_count=200000" | jq --slurpfile d dataset.json '$d[0] + {initial_coefficients: .last_coefficients}' > next.json
+```
+
+```bash
+curl -s -X POST -F "dataset=@next.json" "http://localhost:3000/train?loop_count=200000"
+```
+
+Two runs of 200000 iterations on the sample data set land on exactly what a single run
+of 400000 reaches — the same coefficients to the last bit, since nothing but the
+starting point distinguishes the second call from a continuation of the first:
+
+```text
+0      -> 200000  {"last_coefficients":[386.94817672821796,-210.66512190655385,764.9043122781602],"J_before_learning":1818750000.0,"J_after_learning":4516124.886161309}
+200000 -> 400000  {"last_coefficients":[385.6281263785745,-355.59201959840124,1418.405456447226],"J_before_learning":4516124.886161306,"J_after_learning":3767351.858096715}
+
+0      -> 400000  {"last_coefficients":[385.6281263785745,-355.59201959840124,1418.405456447226],"J_before_learning":1818750000.0,"J_after_learning":3767351.858096715}
+```
+
+The one thing this buys that a longer `loop_count` does not is a look at the cost
+part-way: each leg reports its own `J_before_learning` and `J_after_learning`, so a
+run that is drifting towards divergence shows it before the whole budget is spent.
+
 ## Layout
 
 ```text
@@ -201,13 +259,25 @@ src/
 The layering is one-directional: the model knows nothing about JSON, and
 `json_converter` knows nothing about HTTP. `json_converter` validates the payload
 before the model's constructor is reached, so data arriving from outside can never
-trigger the panics that constructor documents.
+trigger the panics that constructor documents. Its `n + 1` check on
+`initial_coefficients` is what earns that guarantee now the vector comes from the
+request rather than being built by the handler — the constructor panics on a
+coefficient vector of the wrong length, and this is the check that stops one reaching
+it.
 
 ## Known limitations
 
 These are either deliberate or on the roadmap — listed so nobody has to rediscover
 them.
 
+- **A single-feature data set ignores `initial_coefficients`.** The handler replaces
+  the vector with zeros whenever its length is 2 (`train_endpoint.rs:35`). Validation
+  has already pinned the length to `n + 1` by that point, so the branch fires on
+  exactly one thing: `n == 1`. A one-feature model therefore always starts at the
+  origin, silently, whatever was sent — `initial_coefficients: [400.0, 1000.0]` on a
+  one-feature set answers with `J_before_learning` measured at `[0.0, 0.0]`. The
+  guard reads as though it were meant to catch an absent vector, but the field is
+  required, so it can never fire for that reason. Every `n >= 2` set is unaffected.
 - **No divergence guard.** If the learning rate is too large for the data's scale,
   the coefficients overflow to `NaN`. `serde_json` writes non-finite floats as
   `null`, so the endpoint answers `200 OK` with
