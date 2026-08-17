@@ -1,12 +1,14 @@
+use axum::Json;
 use axum::extract::{Multipart, Query};
 use axum::http::StatusCode;
 use crate::{json_converter, train_params};
+use crate::json_converter::TrainingResult;
 use crate::learning_without_feature_scaling::WithoutFeatureScaling;
 
 pub async fn train(
     Query(params) : Query<train_params::TrainParams>,
     mut multipart: Multipart
-) -> Result<String, (StatusCode, String)> {
+) -> Result<Json<TrainingResult>, (StatusCode, String)> {
 
     params.validate().map_err(|e| (e.0, e.1))?;
 
@@ -41,6 +43,12 @@ pub async fn train(
     let (last_coefficients, J_before_learning, J_after_learning) : (Vec<f64>, f64, f64)
         = without_feature_scaling.train_model(params.learning_rate, params.loop_count);
 
-    json_converter::coefficients_to_json(&last_coefficients, J_before_learning, J_after_learning)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+    // `Json` labels the reply `application/json` and serialises straight into the
+    // response body. Returning a `String` built by `coefficients_to_json` sent
+    // the same bytes, but under `text/plain`, and paid for an extra copy.
+    Ok(Json(TrainingResult {
+        last_coefficients,
+        J_before_learning,
+        J_after_learning
+    }))
 }

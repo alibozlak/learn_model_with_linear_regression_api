@@ -83,12 +83,50 @@ How it is put together, and why:
 - **It runs as an unprivileged user** (`app`, uid 999). The server opens no files and
   binds an unprivileged port, so there is nothing for root to do.
 - **The port is fixed at 3000 inside the container**, because `main.rs` binds
-  `0.0.0.0:3000` unconditionally — there is no environment variable to change it.
-  Remap it from the host instead if that port is taken: `-p 8080:3000`.
+  `0.0.0.0:3000` unconditionally — no environment variable overrides it, unlike the
+  `ALLOWED_ORIGINS` described under [CORS](#cors). Remap it from the host instead if
+  that port is taken: `-p 8080:3000`.
 
 `.dockerignore` keeps `target/` out of the build context. It grows to a few hundred
 megabytes as soon as the project is built locally, and every byte would otherwise be
 handed to the daemon on each build.
+
+## CORS
+
+A browser will not hand a cross-origin response to JavaScript unless the reply carries
+`Access-Control-Allow-Origin`, so a page served from anywhere other than this server's
+own origin cannot read an answer without the `CorsLayer` in `main.rs`.
+
+The layer sits outermost, which is what lets a preflight be answered before the body
+limit or the router see the request. Without it a browser's `OPTIONS /train` reaches a
+router that carries only a `POST` route, comes back `405`, and the preflight fails
+before the real request is ever sent.
+
+Allowed origins come from `ALLOWED_ORIGINS`, comma-separated. The default is
+`http://localhost:4200`, which is where `ng serve` puts an Angular dev server:
+
+```bash
+ALLOWED_ORIGINS="http://localhost:4200,https://bozlak.dev" cargo run --release
+```
+
+```bash
+docker run --rm -p 3000:3000 -e ALLOWED_ORIGINS="https://bozlak.dev" linear-regression-api
+```
+
+Only `POST` is advertised and only `Content-Type` is accepted as a request header. A
+`multipart/form-data` upload is a content type the CORS spec safelists, so a browser
+sends it without a preflight at all — the preflight path matters for clients that send
+something else, such as a raw `application/json` body.
+
+`curl` neither sends a preflight nor looks at any of these headers, so an endpoint that
+answers from the terminal can still be unreachable from a browser. That gap is the
+usual reason a client reports a status of 0 while the server log shows nothing wrong.
+
+**This is not access control.** The check happens in the browser, against the response.
+A request from a disallowed origin — or from anything that is not a browser — still
+reaches the handler and still trains the model; the browser merely refuses to let the
+page read the answer. An authenticating proxy in front is what restricts the endpoint,
+rather than making it usable from one page.
 
 ## API
 
@@ -155,11 +193,14 @@ The defaults are values this kind of data set converges under. Because the featu
 are unscaled, a learning rate even one order of magnitude larger diverges — see the
 note under [Known limitations](#known-limitations).
 
-**Response** — `200 OK`, single-line JSON:
+**Response** — `200 OK`, `Content-Type: application/json`, single-line:
 
 ```json
 {"last_coefficients":[386.94817672821796,-210.66512190655385,764.9043122781602],"J_before_learning":1818750000.0,"J_after_learning":4516124.886161309}
 ```
+
+The handler returns `Json<TrainingResult>` rather than a `String`, which is what sets
+that content type; error replies stay `text/plain`, as the table below describes.
 
 `last_coefficients` is laid out as `[a_1, ..., a_n, b]` — the bias occupies the last
 slot, so the array is `n + 1` long, and it is accepted verbatim as the next request's
@@ -249,7 +290,7 @@ run that is drifting towards divergence shows it before the whole budget is spen
 
 ```text
 src/
-├── main.rs                               Router, body limit, server bootstrap
+├── main.rs                               Router, body limit, CORS, server bootstrap
 ├── train_endpoint.rs                     The POST /train handler
 ├── train_params.rs                       Query parameters and their validation
 ├── json_converter.rs                     JSON <-> the model's vectors, plus validation
