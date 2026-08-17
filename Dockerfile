@@ -35,8 +35,15 @@ COPY --from=builder \
      /app/target/release/learn_model_with_linear_regression_api \
      /usr/local/bin/linear-regression-api
 
-# main.rs binds 0.0.0.0:3000 unconditionally; the port is not configurable from
-# outside, so publish it with -p on the host side instead.
+# The binary defaults to loopback, which inside a container shuts out even its
+# own host, so the image has to listen on all interfaces. Privacy is enforced by
+# publishing to 127.0.0.1 on the host side, or by not publishing at all.
+ENV BIND_ADDR=0.0.0.0:3000
+
+# Where the scaling hop goes. Compose overrides this with its service name; the
+# default assumes both processes share a network namespace.
+ENV DATA_MANIPULATE_URL=http://127.0.0.1:3001/manipulate-datas
+
 EXPOSE 3000
 
 CMD ["/usr/local/bin/linear-regression-api"]

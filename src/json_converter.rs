@@ -47,10 +47,23 @@ pub struct TrainingData {
 /// `{"last_coefficients": [a_1, ..., a_n, b]}`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrainingResult {
-    /// The coefficients `train_model` returned, the bias `b` in the last slot.
+    /// The coefficients `train_model` returned, mapped back into the caller's
+    /// units, the bias `b` in the last slot.
     pub last_coefficients : Vec<f64>,
+
+    /// The cost before and after the run, measured in the rescaled space the
+    /// descent actually minimises over — not in the caller's units.
     pub J_before_learning : f64,
     pub J_after_learning : f64,
+
+    /// The power of ten each column was divided by, one per feature with the
+    /// exponent for `outputs` last. Reported so a caller can redo the mapping
+    /// themselves.
+    pub ratios : Vec<usize>,
+
+    /// The coefficients exactly as the descent left them, before the mapping
+    /// back. Useful for telling a scaling problem apart from a training one.
+    pub scaled_last_coefficients : Vec<f64>,
 }
 
 /// Everything that can go wrong while converting between JSON and the model's
@@ -134,39 +147,20 @@ pub fn training_data_from_json(
     Ok((data.inputs, data.outputs, data.initial_coefficients))
 }
 
-/// Serialises the coefficients a training run ended with into a single JSON
-/// line.
+/// Serialises a training run's outcome into a single JSON line.
 ///
-/// Accepts a slice, so both the `Vec<f64>` returned by `train_model` and a
-/// plain array can be passed without cloning at the call site.
-pub fn coefficients_to_json(
-    last_coefficients : &[f64],
-    J_before_learning : f64,
-    J_after_learning : f64,
-) -> Result<String, JsonConverterError> {
-    let result = TrainingResult {
-        last_coefficients : last_coefficients.to_vec(),
-        J_before_learning,
-        J_after_learning
-    };
-
-    Ok(serde_json::to_string(&result)?)
+/// The endpoint no longer goes through this: it hands axum a
+/// [`TrainingResult`] and lets `Json` serialise straight into the response
+/// body. This stays for callers outside the HTTP path, which is why it takes
+/// the whole struct rather than repeating its fields as arguments.
+pub fn result_to_json(result : &TrainingResult) -> Result<String, JsonConverterError> {
+    Ok(serde_json::to_string(result)?)
 }
 
-/// Same as [`coefficients_to_json`], but indented for output a human reads or
-/// for a file kept under version control.
-pub fn coefficients_to_json_pretty(
-    last_coefficients : &[f64],
-    J_before_learning : f64,
-    J_after_learning : f64
-) -> Result<String, JsonConverterError> {
-    let result = TrainingResult {
-        last_coefficients : last_coefficients.to_vec(),
-        J_before_learning,
-        J_after_learning,
-    };
-
-    Ok(serde_json::to_string_pretty(&result)?)
+/// Same as [`result_to_json`], but indented for output a human reads or for a
+/// file kept under version control.
+pub fn result_to_json_pretty(result : &TrainingResult) -> Result<String, JsonConverterError> {
+    Ok(serde_json::to_string_pretty(result)?)
 }
 
 /// Rejects payloads that parse as JSON but cannot describe a training set.

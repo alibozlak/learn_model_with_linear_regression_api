@@ -1,0 +1,42 @@
+# Runs the training chain with only one way in.
+#
+# `data-manipulate` publishes no port at all, so nothing outside this compose
+# network can reach it — not the browser, not another machine, not the host.
+# `learn-model` is the single entry point, and it is published to 127.0.0.1
+# rather than 0.0.0.0, so it is reachable from this machine's browser and from
+# nowhere else.
+#
+# Build the scaler's image first, from its own directory:
+#   docker build -t data_manipulate_api ../data_manipulate_api
+
+services:
+  data-manipulate:
+    image: data_manipulate_api
+    environment:
+      # Inside a container loopback would shut out the other service too, so
+      # this one listens on all interfaces — the network, not the bind address,
+      # is what keeps it private here.
+      BIND_ADDR: 0.0.0.0:3001
+    networks:
+      - training
+    restart: unless-stopped
+
+  learn-model:
+    build: .
+    # The host side is pinned to loopback on purpose. Dropping the 127.0.0.1
+    # prefix would publish the port on every interface and undo the isolation.
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      BIND_ADDR: 0.0.0.0:3000
+      DATA_MANIPULATE_URL: http://data-manipulate:3001/manipulate-datas
+      ALLOWED_ORIGINS: http://localhost:4200
+    depends_on:
+      - data-manipulate
+    networks:
+      - training
+    restart: unless-stopped
+
+networks:
+  training:
+    driver: bridge

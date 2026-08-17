@@ -10,8 +10,16 @@ pub struct TrainParams {
     pub loop_count: usize
 }
 
-fn default_learning_rate() -> f64 { 0.000003 }
-fn default_loop_count() -> usize { 1_000_000 }
+/// Sized for the rescaled data the descent now runs on, not the caller's raw
+/// magnitudes. Single-digit columns tolerate a step some four orders of
+/// magnitude larger than unscaled ones did, and reach a lower cost in a
+/// fiftieth of the iterations.
+///
+/// The ceiling is data-dependent — a column the scaler leaves alone, because it
+/// is already below 10, still drives the curvature — so these sit well under
+/// the point where the sample data set diverges rather than at it.
+fn default_learning_rate() -> f64 { 0.01 }
+fn default_loop_count() -> usize { 20_000 }
 
 const MAX_LOOP_COUNT: usize = 5_000_000;
 
