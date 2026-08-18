@@ -1,7 +1,7 @@
 use axum::Json;
 use axum::extract::{Multipart, Query};
 use axum::http::StatusCode;
-use crate::{data_manipulate_client, json_converter, train_params, unit_mapping};
+use crate::{data_manipulate_client, json_converter, train_params};
 use crate::json_converter::TrainingResult;
 use crate::learning_without_feature_scaling::WithoutFeatureScaling;
 
@@ -28,16 +28,17 @@ pub async fn train(
         "Form hasn't a 'dataset' named field !!".to_string(),
     ))?;
 
-    // Parsed here as well as by the scaler, because `initial_coefficients` is
-    // the caller's and does not come back from the hop, and because the checks
-    // this runs decide what the caller is told when the payload is malformed.
-    let (inputs, _outputs, initial_coefficients)
-        = json_converter::training_data_from_json(&json_real_datas)
+    // Parsed here as well as by the scaler, because the checks this runs decide
+    // what the caller is told when the payload is malformed.
+    let (inputs, _outputs) = json_converter::training_data_from_json(&json_real_datas)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let n : usize = inputs[0].len();
 
-    let mut initial_coefficients : Vec<f64> = initial_coefficients;
-    if initial_coefficients.len() == 2 { initial_coefficients = vec![0.0; n+1] }
+    // The descent always starts at the origin. A caller-supplied starting point
+    // would be expressed in the units of the data set they sent, which is not
+    // the space the descent runs in once the scaler has been through it, so
+    // there is nothing coherent for the payload to say here.
+    let initial_coefficients : Vec<f64> = vec![0.0; n + 1];
 
     // The hop that makes a sane learning rate possible: the descent runs on
     // single-digit columns instead of the caller's raw magnitudes.
@@ -53,23 +54,17 @@ pub async fn train(
         ));
     }
 
-    // The starting point arrives in the caller's units and has to be carried
-    // into scaled space, or the descent would begin somewhere they never asked
-    // for.
-    let scaled_initial = unit_mapping::to_scaled_units(&initial_coefficients, &scaled.ratios);
-
     let mut without_feature_scaling = WithoutFeatureScaling::new(
-        scaled.inputs, scaled.outputs, scaled_initial
+        scaled.inputs, scaled.outputs, initial_coefficients
     );
 
     let (scaled_coefficients, J_before_learning, J_after_learning) : (Vec<f64>, f64, f64)
         = without_feature_scaling.train_model(params.learning_rate, params.loop_count);
 
+    // Everything is reported in the scaled space the descent ran in. `ratios`
+    // travels with it so the caller can lift the coefficients back into the
+    // units their data set was in before the scaler saw it.
     Ok(Json(TrainingResult {
-        // Handed back in the caller's units, which is both what is useful to
-        // them and what makes the answer valid as the next run's
-        // `initial_coefficients`.
-        last_coefficients : unit_mapping::to_original_units(&scaled_coefficients, &scaled.ratios),
         J_before_learning,
         J_after_learning,
         ratios : scaled.ratios,

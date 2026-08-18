@@ -9,7 +9,6 @@ mod json_converter;
 mod data_manipulate_client;
 mod train_endpoint;
 mod train_params;
-mod unit_mapping;
 
 #[tokio::main]
 async fn main() {
