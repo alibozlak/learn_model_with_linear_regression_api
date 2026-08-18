@@ -107,11 +107,19 @@ docker build -t linear-regression-api .
 ```
 
 ```bash
-docker run --rm -p 3000:3000 linear-regression-api
+docker run --rm -p 127.0.0.1:3000:3000 \
+  -e DATA_MANIPULATE_URL=http://<scaler-host>:3001/manipulate-datas \
+  linear-regression-api
 ```
 
 The image is always the optimised build, so the `--release` caveat above does not
-apply to it.
+apply to it. Released builds are pushed to Docker Hub under `bozlak`; a deployment
+pulls the tag from there rather than building from this tree.
+
+**Composing the stack is not this repository's job.** The file that runs this image
+alongside the scaler and a reverse proxy lives in its own directory, outside any of
+the three projects, and pulls all three from the Hub by tag. What it has to get right
+is described under [Keeping the pair private](#keeping-the-pair-private).
 
 How it is put together, and why:
 
@@ -142,44 +150,42 @@ All optional, all read once at startup:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `BIND_ADDR` | `127.0.0.1:3000` | Where the server listens. Loopback keeps it off the network; a container has to override it to `0.0.0.0:3000` or nothing reaches it, even from its own host. |
-| `DATA_MANIPULATE_URL` | `http://127.0.0.1:3001/manipulate-datas` | The scaler's endpoint. Compose points this at the service name. |
+| `DATA_MANIPULATE_URL` | `http://127.0.0.1:3001/manipulate-datas` | The scaler's endpoint. A compose stack points this at the scaler's service name. |
 | `ALLOWED_ORIGINS` | `http://localhost:4200` | Comma-separated origins the browser may read a reply from — see [CORS](#cors). |
 
 ## Keeping the pair private
 
 Only the Angular app is meant to reach these services, and what enforces that is the
-network, not a header.
+network, not a header. The compose file that arranges this lives outside these
+repositories; what it has to get right is the following.
 
-**Neither Rust service publishes a port.** Under `docker-compose.yml` they carry no
-`ports:` entry at all, so the only thing that can reach them is another service on the
-same private network. **`gateway`, an nginx, is the single published thing**, and it is
-published to `127.0.0.1:8080` — so nothing off this machine reaches any of it. It
-proxies `/api/linear-regression/` to `learn-model`, stripping the prefix, so
-`/api/linear-regression/train` arrives as `/train`.
+**Neither Rust service should publish a port.** With no `ports:` entry the only thing
+that can reach them is another service on the same private network. **A reverse proxy
+is the single published thing**, pinned to `127.0.0.1` on the host side, so nothing off
+the machine reaches any of it. Routing `/api/linear-regression/` to this service with
+the prefix stripped makes `/api/linear-regression/train` arrive as `/train`.
 
-Both services still listen on `0.0.0.0` **inside** their containers, and that is not a
-hole. A container bound to loopback is unreachable from its own host and from every
-other container; publishing a port does not change it. Running the release binary in a
-`debian:bookworm-slim` container:
+Two settings on that proxy matter, because their defaults break this endpoint:
+
+| Setting | Default | Why it has to change |
+| --- | --- | --- |
+| `client_max_body_size` | `1m` in nginx | A data set is rejected with the proxy's own `413` long before this service's 32 MB limit applies |
+| `proxy_read_timeout` | `60s` in nginx | A large `loop_count` holds the connection open for the whole descent and is cut off with a `504` |
+
+**Both services must keep listening on `0.0.0.0` inside their containers.** That is not
+a hole, and loopback there is not an improvement — it is unreachable from the host and
+from every other container alike, so it would break the chain and buy nothing. Verified
+by running the release binary in a `debian:bookworm-slim` container:
 
 | Inside the container | Host mapping | Result |
 | --- | --- | --- |
 | `BIND_ADDR=127.0.0.1:3001` | `-p 13001:3001` | connection refused |
 | `BIND_ADDR=0.0.0.0:3001` | `-p 127.0.0.1:13001:3001` | `405` — service answers |
 
-Binding loopback inside the containers would simply break the chain, and buy nothing:
-the second row is already private to the machine, because of the `127.0.0.1:` on the
-**host** side of the mapping.
+The second row is already private to the machine: the `127.0.0.1:` on the **host** side
+of the mapping is what does that, not the bind address inside the container.
 
-```bash
-docker build -t data_manipulate_api ../data_manipulate_api
-```
-
-```bash
-docker compose up --build
-```
-
-Measured on the stack that comes up:
+Measured on a stack arranged this way:
 
 | Request | Result |
 | --- | --- |
@@ -195,14 +201,13 @@ learn-model       3000/tcp
 data-manipulate   3001/tcp
 ```
 
-Mounting an Angular build into the gateway — the commented-out volume in
-`docker-compose.yml` — puts the page and the API on one origin, which drops the
-preflight and makes the CORS headers moot. `ng serve` on `:4200` remains a separate
-origin and still needs them.
+Serving the Angular build from that same proxy puts the page and the API on one origin,
+which drops the preflight and makes the CORS headers moot. `ng serve` on `:4200`
+remains a separate origin and still needs them.
 
 What none of this does is prove the caller is the Angular app. An SPA ships its own
 source to the browser, so any key it could present is readable by whoever opens
-devtools; `curl` from this machine reaches the gateway exactly as the page does.
+devtools; `curl` from this machine reaches the proxy exactly as the page does.
 Restricting by network is real, and it is the honest limit of what is enforceable
 here — anything stronger means authenticating the user, not the app.
 
@@ -381,10 +386,6 @@ src/
 ├── json_converter.rs                     JSON <-> the model's vectors, plus validation
 └── learning_without_feature_scaling.rs   The model: hypothesis, cost, gradients, descent
 ```
-
-`docker-compose.yml` and `nginx.conf` sit at the root: the compose file wires the two
-services onto a private network, and `nginx.conf` is the only thing the outside talks
-to. See [Keeping the pair private](#keeping-the-pair-private).
 
 The layering is one-directional: the model knows nothing about JSON, and
 `json_converter` knows nothing about HTTP. `json_converter` validates the payload
