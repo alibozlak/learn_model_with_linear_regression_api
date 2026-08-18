@@ -14,7 +14,7 @@
 //! and the result of a training run is written back as:
 //!
 //! ```json
-//! { "last_coefficients": [375.13, -195.00, 1807.28] }
+//! { "scaled_last_coefficients": [375.13, -195.00, 1807.28] }
 //! ```
 //!
 //! Nothing in this crate's `main` calls into this module — it exists to be
@@ -38,19 +38,28 @@ pub struct TrainingData {
     pub inputs : Vec<Vec<f64>>,
 
     /// The expected output of the sample at the same index in [`Self::inputs`].
-    pub outputs : Vec<f64>,
-
-    pub initial_coefficients : Vec<f64>
+    pub outputs : Vec<f64>
 }
 
-/// The outcome of a training run, serialised as
-/// `{"last_coefficients": [a_1, ..., a_n, b]}`.
+/// The outcome of a training run.
+///
+/// Everything here is in the rescaled space the descent runs in. Mapping back
+/// to the units the data set was in before scaling is the caller's to do, from
+/// [`Self::ratios`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrainingResult {
-    /// The coefficients `train_model` returned, the bias `b` in the last slot.
-    pub last_coefficients : Vec<f64>,
+    /// The cost before and after the run, measured in the rescaled space the
+    /// descent actually minimises over.
     pub J_before_learning : f64,
     pub J_after_learning : f64,
+
+    /// The power of ten each column was divided by, one per feature with the
+    /// exponent for `outputs` last, as `data_manipulate_api` reported it.
+    pub ratios : Vec<usize>,
+
+    /// The coefficients the descent ended on, the bias `b` in the last slot,
+    /// so the vector is `n + 1` long.
+    pub scaled_last_coefficients : Vec<f64>,
 }
 
 /// Everything that can go wrong while converting between JSON and the model's
@@ -74,9 +83,7 @@ pub enum JsonConverterError {
     SampleCountMismatch { inputs : usize, outputs : usize },
 
     /// One sample carries a different number of features than the first one.
-    RaggedSample { index : usize, expected : usize, found : usize },
-
-    InitialCoefficientsCountMismatch
+    RaggedSample { index : usize, expected : usize, found : usize }
 }
 
 impl fmt::Display for JsonConverterError {
@@ -91,9 +98,6 @@ impl fmt::Display for JsonConverterError {
             Self::RaggedSample { index, expected, found } => write!(
                 f,
                 "sample {index} has {found} feature(s) while the first sample has {expected}"
-            ),
-            Self::InitialCoefficientsCountMismatch => write!(
-                f, "\"initial_coefficients count\" - 1 is not equal to feature count !!"
             )
         }
     }
@@ -123,50 +127,31 @@ impl From<serde_json::Error> for JsonConverterError {
 /// ```text
 /// let json = r#"{"inputs": [[55.0, 1.0]], "outputs": [23000.0]}"#;
 /// let (inputs, outputs) = json_converter::training_data_from_json(json)?;
-/// let mut model = WithoutFeatureScaling::new(inputs, outputs, vec![0.0; 3]);
+/// let mut model = WithoutFeatureScaling::new(inputs, outputs, vec![0.0; 2]);
 /// ```
 pub fn training_data_from_json(
     json : &str
-) -> Result<(Vec<Vec<f64>>, Vec<f64>, Vec<f64>), JsonConverterError> {
+) -> Result<(Vec<Vec<f64>>, Vec<f64>), JsonConverterError> {
     let data : TrainingData = serde_json::from_str(json)?;
     validate(&data)?;
 
-    Ok((data.inputs, data.outputs, data.initial_coefficients))
+    Ok((data.inputs, data.outputs))
 }
 
-/// Serialises the coefficients a training run ended with into a single JSON
-/// line.
+/// Serialises a training run's outcome into a single JSON line.
 ///
-/// Accepts a slice, so both the `Vec<f64>` returned by `train_model` and a
-/// plain array can be passed without cloning at the call site.
-pub fn coefficients_to_json(
-    last_coefficients : &[f64],
-    J_before_learning : f64,
-    J_after_learning : f64,
-) -> Result<String, JsonConverterError> {
-    let result = TrainingResult {
-        last_coefficients : last_coefficients.to_vec(),
-        J_before_learning,
-        J_after_learning
-    };
-
-    Ok(serde_json::to_string(&result)?)
+/// The endpoint no longer goes through this: it hands axum a
+/// [`TrainingResult`] and lets `Json` serialise straight into the response
+/// body. This stays for callers outside the HTTP path, which is why it takes
+/// the whole struct rather than repeating its fields as arguments.
+pub fn result_to_json(result : &TrainingResult) -> Result<String, JsonConverterError> {
+    Ok(serde_json::to_string(result)?)
 }
 
-/// Same as [`coefficients_to_json`], but indented for output a human reads or
-/// for a file kept under version control.
-pub fn coefficients_to_json_pretty(
-    last_coefficients : &[f64],
-    J_before_learning : f64,
-    J_after_learning : f64
-) -> Result<String, JsonConverterError> {
-    let result = TrainingResult {
-        last_coefficients : last_coefficients.to_vec(),
-        J_before_learning,
-        J_after_learning,
-    };
-
-    Ok(serde_json::to_string_pretty(&result)?)
+/// Same as [`result_to_json`], but indented for output a human reads or for a
+/// file kept under version control.
+pub fn result_to_json_pretty(result : &TrainingResult) -> Result<String, JsonConverterError> {
+    Ok(serde_json::to_string_pretty(result)?)
 }
 
 /// Rejects payloads that parse as JSON but cannot describe a training set.
@@ -195,10 +180,6 @@ fn validate(data : &TrainingData) -> Result<(), JsonConverterError> {
                 found : sample.len()
             });
         }
-    }
-
-    if n + 1 != data.initial_coefficients.len() {
-        return Err(JsonConverterError::InitialCoefficientsCountMismatch);
     }
 
     Ok(())

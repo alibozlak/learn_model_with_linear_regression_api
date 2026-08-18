@@ -1,7 +1,7 @@
 use axum::Json;
 use axum::extract::{Multipart, Query};
 use axum::http::StatusCode;
-use crate::{json_converter, train_params};
+use crate::{data_manipulate_client, json_converter, train_params};
 use crate::json_converter::TrainingResult;
 use crate::learning_without_feature_scaling::WithoutFeatureScaling;
 
@@ -28,27 +28,46 @@ pub async fn train(
         "Form hasn't a 'dataset' named field !!".to_string(),
     ))?;
 
-    let (inputs, outputs, initial_coefficients) 
-        = json_converter::training_data_from_json(&json_real_datas)
+    // Parsed here as well as by the scaler, because the checks this runs decide
+    // what the caller is told when the payload is malformed.
+    let (inputs, _outputs) = json_converter::training_data_from_json(&json_real_datas)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let n : usize = inputs[0].len();
 
-    let mut initial_coefficients : Vec<f64> = initial_coefficients;
-    if initial_coefficients.len() == 2 { initial_coefficients = vec![0.0; n+1] }
+    // The descent always starts at the origin. A caller-supplied starting point
+    // would be expressed in the units of the data set they sent, which is not
+    // the space the descent runs in once the scaler has been through it, so
+    // there is nothing coherent for the payload to say here.
+    let initial_coefficients : Vec<f64> = vec![0.0; n + 1];
+
+    // The hop that makes a sane learning rate possible: the descent runs on
+    // single-digit columns instead of the caller's raw magnitudes.
+    let scaled = data_manipulate_client::rescale(json_real_datas).await?;
+
+    if scaled.ratios.len() != n + 1 {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "the scaling service returned {} ratios for {n} feature(s), expected {}",
+                scaled.ratios.len(), n + 1
+            )
+        ));
+    }
 
     let mut without_feature_scaling = WithoutFeatureScaling::new(
-        inputs, outputs, initial_coefficients
+        scaled.inputs, scaled.outputs, initial_coefficients
     );
 
-    let (last_coefficients, J_before_learning, J_after_learning) : (Vec<f64>, f64, f64)
+    let (scaled_coefficients, J_before_learning, J_after_learning) : (Vec<f64>, f64, f64)
         = without_feature_scaling.train_model(params.learning_rate, params.loop_count);
 
-    // `Json` labels the reply `application/json` and serialises straight into the
-    // response body. Returning a `String` built by `coefficients_to_json` sent
-    // the same bytes, but under `text/plain`, and paid for an extra copy.
+    // Everything is reported in the scaled space the descent ran in. `ratios`
+    // travels with it so the caller can lift the coefficients back into the
+    // units their data set was in before the scaler saw it.
     Ok(Json(TrainingResult {
-        last_coefficients,
         J_before_learning,
-        J_after_learning
+        J_after_learning,
+        ratios : scaled.ratios,
+        scaled_last_coefficients : scaled_coefficients
     }))
 }

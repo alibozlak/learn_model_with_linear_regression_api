@@ -6,6 +6,7 @@ use tower_http::cors::CorsLayer;
 
 mod learning_without_feature_scaling;
 mod json_converter;
+mod data_manipulate_client;
 mod train_endpoint;
 mod train_params;
 
@@ -19,7 +20,14 @@ async fn main() {
         // router ever see the request.
         .layer(cors_layer());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    // Loopback by default: this is the only service the browser talks to, and
+    // reaching it from another machine is not part of the local setup. The
+    // image overrides it, because a container bound to loopback is unreachable
+    // even from its own host.
+    let bind_addr = std::env::var("BIND_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
     println!("Listening on {}", listener.local_addr().unwrap());
 
     axum::serve(listener, app).await.unwrap();

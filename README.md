@@ -4,10 +4,12 @@ Multivariable linear regression trained with batch gradient descent, exposed ove
 HTTP. Written from scratch — no `ndarray`, no `linfa`, no autodiff — so that every
 step of the math is visible in the source.
 
-The "without feature scaling" in the module name is deliberate: the features keep
-their original ranges, which makes the cost surface a long narrow valley and forces
-a very small learning rate. Seeing that behaviour is the point of this project, not
-a limitation to be worked around.
+The model itself still does no scaling — "without feature scaling" in the module
+name is literal, and the long narrow valley that unscaled features carve out is
+worth seeing. The scaling now happens one step earlier instead: `/train` hands the
+data set to `data_manipulate_api` first and trains on what comes back, which is
+what lets the learning rate be a sane number. See
+[The training chain](#the-training-chain).
 
 ## The math
 
@@ -36,10 +38,50 @@ derivatives computed from the *same* unchanged coefficients — the update is
 simultaneous, which is why the new values are staged in a temporary vector before
 being written back.
 
+## The training chain
+
+`POST /train` does not train on the data set it is given. It forwards the payload
+to `data_manipulate_api`, which divides each column by a power of ten until it is
+single-digit, and the descent runs on that:
+
+```text
+Angular  ──POST /train──>  learn_model  ──POST /manipulate-datas──>  data_manipulate
+                                │                                          │
+                                │  <────── scaled columns + ratios ────────┘
+                                │
+                                └──> descent on scaled data ──> coefficients (scaled)
+```
+
+The point is the learning rate. On the sample data set below, raw magnitudes need
+`0.000003`, and a step even one order larger diverges. On the rescaled columns
+`0.05` is still stable and `0.01` is comfortable — roughly four orders of magnitude
+more room — and 5000 iterations reach a lower cost than a million did before.
+
+Coefficients come back **in the scaled space**, as `scaled_last_coefficients`, with
+`ratios` alongside them. Lifting them into the units the data set was written in is
+the caller's to do:
+
+```text
+a_j = a'_j * 10^(r_y - r_j)      b = b' * 10^r_y
+```
+
+There is no starting point to send. The descent always begins at the origin, because
+a caller-supplied one would be expressed in the units of the payload, which is not
+the space the descent runs in once the scaler has been through it.
+
+> **Caveat on the mapping.** The scaler picks its exponent per value, not per column,
+> so `ratios` describes only the first sample. On a column of mixed magnitudes the
+> conversion above is wrong for every row whose exponent differs from row 0's — see
+> [Known limitations](#known-limitations).
+
+The hop is the only way in for the scaler: nothing else needs to reach it, which is
+what [Keeping the pair private](#keeping-the-pair-private) relies on.
+
 ## Requirements
 
 - Rust (edition 2024)
 - No system dependencies
+- A reachable `data_manipulate_api` — `/train` answers `502` without it
 
 Docker alone is enough if you would rather not install a toolchain — see
 [Docker](#docker) below.
@@ -50,7 +92,8 @@ Docker alone is enough if you would rather not install a toolchain — see
 cargo run
 ```
 
-The server binds `0.0.0.0:3000` and prints the address it is listening on. Use
+The server binds `127.0.0.1:3000` and prints the address it is listening on. Set
+`BIND_ADDR` to change it — see [Configuration](#configuration). Use
 `cargo run --release` for anything larger than a toy data set — the training loop is
 roughly two orders of magnitude faster with optimisations on.
 
@@ -64,11 +107,19 @@ docker build -t linear-regression-api .
 ```
 
 ```bash
-docker run --rm -p 3000:3000 linear-regression-api
+docker run --rm -p 127.0.0.1:3000:3000 \
+  -e DATA_MANIPULATE_URL=http://<scaler-host>:3001/manipulate-datas \
+  linear-regression-api
 ```
 
 The image is always the optimised build, so the `--release` caveat above does not
-apply to it.
+apply to it. Released builds are pushed to Docker Hub under `bozlak`; a deployment
+pulls the tag from there rather than building from this tree.
+
+**Composing the stack is not this repository's job.** The file that runs this image
+alongside the scaler and a reverse proxy lives in its own directory, outside any of
+the three projects, and pulls all three from the Hub by tag. What it has to get right
+is described under [Keeping the pair private](#keeping-the-pair-private).
 
 How it is put together, and why:
 
@@ -82,14 +133,83 @@ How it is put together, and why:
   untouched.
 - **It runs as an unprivileged user** (`app`, uid 999). The server opens no files and
   binds an unprivileged port, so there is nothing for root to do.
-- **The port is fixed at 3000 inside the container**, because `main.rs` binds
-  `0.0.0.0:3000` unconditionally — no environment variable overrides it, unlike the
-  `ALLOWED_ORIGINS` described under [CORS](#cors). Remap it from the host instead if
-  that port is taken: `-p 8080:3000`.
+- **The listening address comes from `BIND_ADDR`**, which the image sets to
+  `0.0.0.0:3000`; the binary's own default is loopback, and a container bound to
+  loopback is unreachable even from its own host. Remapping from the host is still
+  the simpler way to move the port: `-p 127.0.0.1:8080:3000`. Keep the `127.0.0.1:`
+  prefix — see [Keeping the pair private](#keeping-the-pair-private).
 
 `.dockerignore` keeps `target/` out of the build context. It grows to a few hundred
 megabytes as soon as the project is built locally, and every byte would otherwise be
 handed to the daemon on each build.
+
+## Configuration
+
+All optional, all read once at startup:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BIND_ADDR` | `127.0.0.1:3000` | Where the server listens. Loopback keeps it off the network; a container has to override it to `0.0.0.0:3000` or nothing reaches it, even from its own host. |
+| `DATA_MANIPULATE_URL` | `http://127.0.0.1:3001/manipulate-datas` | The scaler's endpoint. A compose stack points this at the scaler's service name. |
+| `ALLOWED_ORIGINS` | `http://localhost:4200` | Comma-separated origins the browser may read a reply from — see [CORS](#cors). |
+
+## Keeping the pair private
+
+Only the Angular app is meant to reach these services, and what enforces that is the
+network, not a header. The compose file that arranges this lives outside these
+repositories; what it has to get right is the following.
+
+**Neither Rust service should publish a port.** With no `ports:` entry the only thing
+that can reach them is another service on the same private network. **A reverse proxy
+is the single published thing**, pinned to `127.0.0.1` on the host side, so nothing off
+the machine reaches any of it. Routing `/api/linear-regression/` to this service with
+the prefix stripped makes `/api/linear-regression/train` arrive as `/train`.
+
+Two settings on that proxy matter, because their defaults break this endpoint:
+
+| Setting | Default | Why it has to change |
+| --- | --- | --- |
+| `client_max_body_size` | `1m` in nginx | A data set is rejected with the proxy's own `413` long before this service's 32 MB limit applies |
+| `proxy_read_timeout` | `60s` in nginx | A large `loop_count` holds the connection open for the whole descent and is cut off with a `504` |
+
+**Both services must keep listening on `0.0.0.0` inside their containers.** That is not
+a hole, and loopback there is not an improvement — it is unreachable from the host and
+from every other container alike, so it would break the chain and buy nothing. Verified
+by running the release binary in a `debian:bookworm-slim` container:
+
+| Inside the container | Host mapping | Result |
+| --- | --- | --- |
+| `BIND_ADDR=127.0.0.1:3001` | `-p 13001:3001` | connection refused |
+| `BIND_ADDR=0.0.0.0:3001` | `-p 127.0.0.1:13001:3001` | `405` — service answers |
+
+The second row is already private to the machine: the `127.0.0.1:` on the **host** side
+of the mapping is what does that, not the bind address inside the container.
+
+Measured on a stack arranged this way:
+
+| Request | Result |
+| --- | --- |
+| `POST 127.0.0.1:8080/api/linear-regression/train` | `200`, trained |
+| `127.0.0.1:3000` and `127.0.0.1:3001` from the host | connection refused |
+| `<this machine's LAN address>:8080` | connection refused |
+
+`docker compose ps` should show one published port and no others:
+
+```text
+gateway           127.0.0.1:8080->80/tcp
+learn-model       3000/tcp
+data-manipulate   3001/tcp
+```
+
+Serving the Angular build from that same proxy puts the page and the API on one origin,
+which drops the preflight and makes the CORS headers moot. `ng serve` on `:4200`
+remains a separate origin and still needs them.
+
+What none of this does is prove the caller is the Angular app. An SPA ships its own
+source to the browser, so any key it could present is readable by whoever opens
+devtools; `curl` from this machine reaches the proxy exactly as the page does.
+Restricting by network is real, and it is the honest limit of what is enforceable
+here — anything stronger means authenticating the user, not the app.
 
 ## CORS
 
@@ -133,13 +253,12 @@ rather than making it usable from one page.
 ### `POST /train`
 
 Trains a model on the data set in the request and returns the coefficients it
-converged to. The server keeps no state between requests — the point the descent
-starts from arrives with the request, as `initial_coefficients`.
+converged to. The server keeps no state between requests, and the descent always
+starts at the origin.
 
 **Request** — `multipart/form-data` carrying a single field named `dataset`, whose
-content is the training set as JSON. `inputs[i]` is one sample's feature values,
-`outputs[i]` is that sample's expected value, and `initial_coefficients` is where
-gradient descent begins:
+content is the training set as JSON. `inputs[i]` is one sample's feature values and
+`outputs[i]` is that sample's expected value:
 
 ```json
 {
@@ -151,63 +270,59 @@ gradient descent begins:
     [130.0, 4.0],
     [165.0, 5.0]
   ],
-  "outputs": [23000.0, 30500.0, 38000.0, 44000.0, 48500.0, 61000.0],
-  "initial_coefficients": [0.0, 0.0, 0.0]
+  "outputs": [23000.0, 30500.0, 38000.0, 44000.0, 48500.0, 61000.0]
 }
 ```
 
 Every sample must carry the same number of features. The feature count `n` is read
 from the first sample.
 
-`initial_coefficients` is **required** — leaving it out is a `400`, not a fall back
-to zeros. It is laid out as `[a_1, ..., a_n, b]` with the bias last, so it must be
-exactly `n + 1` long: three entries for the two-feature set above.
-
-**Not wanting to choose a starting point still means sending the field**, filled with
-`n + 1` zeros. There is no shorter stand-in and no value that means "decide for me" —
-a zero vector of some other length is rejected by the length check exactly like any
-other wrong length, so the number of zeros has to follow `n`:
-
-| Features `n` | Send as `initial_coefficients` |
-| --- | --- |
-| 1 | `[0.0, 0.0]` |
-| 2 | `[0.0, 0.0, 0.0]` |
-| 3 | `[0.0, 0.0, 0.0, 0.0]` |
-
-`[0.0, 0.0]` against a two-feature set is a `400`, not a request to start from the
-origin — the two zeros are one short of the three that set needs.
-
-That layout is deliberately the same one `last_coefficients` comes back in, which is
-what makes a run resumable: feed a previous response's coefficients back in and the
-descent picks up where it stopped. Splitting a run in two this way reaches exactly the
-coefficients the undivided run would have — see [Resuming a run](#resuming-a-run).
+There is no `initial_coefficients` field. Earlier versions required one; a payload
+that still carries it is accepted and the field ignored, so existing data sets do not
+have to be edited.
 
 **Query parameters** — both optional, both checked before any training starts:
 
 | Parameter | Default | Accepted | Meaning |
 | --- | --- | --- | --- |
-| `learning_rate` | `0.000003` | finite and `> 0` | Step size of each gradient descent update |
-| `loop_count` | `1000000` | `1` to `5000000` | How many iterations to run |
+| `learning_rate` | `0.01` | finite and `> 0` | Step size of each gradient descent update |
+| `loop_count` | `20000` | `1` to `5000000` | How many iterations to run |
 
-The defaults are values this kind of data set converges under. Because the features
-are unscaled, a learning rate even one order of magnitude larger diverges — see the
-note under [Known limitations](#known-limitations).
+The defaults are sized for the rescaled columns the descent runs on, not the raw
+payload. On the sample data set the ceiling before divergence sits near `0.05`, and
+the defaults stay under it with room to spare, because the ceiling is
+data-dependent: a column the scaler leaves alone, being already below 10, still
+drives the curvature. Measured on that data set:
+
+| `learning_rate` | `loop_count` | `J_after_learning` |
+| --- | --- | --- |
+| `0.08` | 20000 | diverges — `null` coefficients |
+| `0.05` | 5000 | `0.0090` |
+| `0.01` | 20000 | `0.0093` |
+| `0.000003` | 1000000 | `0.0500` |
+
+That last row is what this endpoint needed before the scaling hop existed.
 
 **Response** — `200 OK`, `Content-Type: application/json`, single-line:
 
 ```json
-{"last_coefficients":[386.94817672821796,-210.66512190655385,764.9043122781602],"J_before_learning":1818750000.0,"J_after_learning":4516124.886161309}
+{"J_before_learning":18.187500000000004,"J_after_learning":0.01820230981958408,"ratios":[1,0,4],"scaled_last_coefficients":[-0.05897920763610215,0.8597882776149124,1.7570875999268627]}
 ```
 
 The handler returns `Json<TrainingResult>` rather than a `String`, which is what sets
 that content type; error replies stay `text/plain`, as the table below describes.
 
-`last_coefficients` is laid out as `[a_1, ..., a_n, b]` — the bias occupies the last
-slot, so the array is `n + 1` long, and it is accepted verbatim as the next request's
-`initial_coefficients`. `J_before_learning` and `J_after_learning` are the cost before
-and after the run; comparing them is the quickest way to tell whether the learning
-rate was sane. Note that `J_before_learning` is the cost of the coefficients that were
-*sent in*, so it is only the cost at the origin when zeros were sent.
+| Field | Meaning |
+| --- | --- |
+| `J_before_learning` | Cost at the origin, where every run now starts. |
+| `J_after_learning` | Cost the run ended on. Comparing the two is the quickest way to tell whether the learning rate was sane. |
+| `ratios` | The exponent each column was divided by, one per feature with `outputs` last. |
+| `scaled_last_coefficients` | The fit, as `[a_1, ..., a_n, b]` with the bias last, so `n + 1` long. |
+
+Everything here is in the rescaled space the descent minimises over, so the numbers
+are comparable to each other but not to the magnitudes in the payload. Converting is
+the caller's job: `10^(r_y - r_j)` for a feature's coefficient, `10^r_y` for the bias,
+`10^(2 * r_y)` for a cost, with `r_y` the last entry of `ratios`.
 
 **Errors** — `4xx`/`5xx` with a plain-text body describing the problem:
 
@@ -220,12 +335,15 @@ rate was sane. Note that `J_before_learning` is the cost of the coefficients tha
 | `400` | `loop_count must be at least 1` | `loop_count` is `0` |
 | `400` | `loop_count must not exceed 5000000, got X` | `loop_count` is above the cap |
 | `400` | `invalid JSON payload: ...` | The field is not valid JSON, or does not match the expected shape |
-| `400` | ``invalid JSON payload: missing field `initial_coefficients` at ...`` | The payload carries no `initial_coefficients` at all |
 | `400` | `"inputs" is empty, there is nothing to train on` | `inputs` is `[]` |
 | `400` | `sample count mismatch: N input sample(s) but M output(s)` | `inputs` and `outputs` differ in length |
 | `400` | `sample K has F feature(s) while the first sample has E` | Rows of differing width |
-| `400` | `"initial_coefficients count" - 1 is not equal to feature count !!` | `initial_coefficients` is not `n + 1` long — `[]`, and a zero vector too short for the set, included |
 | `400` | ``Error parsing `multipart/form-data` request`` | The multipart body is malformed, or the request went over the 32 MB body limit |
+| `4xx` | `the scaling service rejected the data set: ...` | `data_manipulate_api` refused the payload; its status and message are passed through, since the data it refused is the caller's |
+| `502` | `could not reach the scaling service at URL: ...` | `data_manipulate_api` is down or the URL is wrong — see [Configuration](#configuration) |
+| `502` | `the scaling service answered STATUS: ...` | It replied, but with a `5xx` |
+| `502` | `could not parse the scaling service's reply: ...` | Its reply was not the expected JSON |
+| `502` | `the scaling service returned N ratios for M feature(s), expected ...` | The scaled data does not match the payload's shape |
 | `500` | serialisation error | The result could not be encoded |
 
 ## Usage with curl
@@ -238,18 +356,17 @@ than take the text literally:
 curl -X POST -F "dataset=@dataset.json" http://localhost:3000/train
 ```
 
-Inline, for a quick check — no `@` this time, so the JSON is used as the value.
-`initial_coefficients` has to be there even when it is all zeros:
+Inline, for a quick check — no `@` this time, so the JSON is used as the value:
 
 ```bash
-curl -X POST -F 'dataset={"inputs":[[55.0,1.0],[130.0,4.0]],"outputs":[23000.0,48500.0],"initial_coefficients":[0.0,0.0,0.0]}' http://localhost:3000/train
+curl -X POST -F 'dataset={"inputs":[[55.0,1.0],[130.0,4.0]],"outputs":[23000.0,48500.0]}' http://localhost:3000/train
 ```
 
 Override either hyperparameter from the query string. Quote the URL, otherwise the
 shell swallows everything from the `&` onwards:
 
 ```bash
-curl -X POST -F "dataset=@dataset.json" "http://localhost:3000/train?learning_rate=0.000001&loop_count=2000000"
+curl -X POST -F "dataset=@dataset.json" "http://localhost:3000/train?learning_rate=0.05&loop_count=5000"
 ```
 
 Pretty-print the response by piping through `jq`:
@@ -258,34 +375,6 @@ Pretty-print the response by piping through `jq`:
 curl -s -X POST -F "dataset=@dataset.json" http://localhost:3000/train | jq
 ```
 
-### Resuming a run
-
-Because `last_coefficients` comes back in the layout `initial_coefficients` expects,
-`jq` can splice one run's answer into the next request's payload:
-
-```bash
-curl -s -X POST -F "dataset=@dataset.json" "http://localhost:3000/train?loop_count=200000" | jq --slurpfile d dataset.json '$d[0] + {initial_coefficients: .last_coefficients}' > next.json
-```
-
-```bash
-curl -s -X POST -F "dataset=@next.json" "http://localhost:3000/train?loop_count=200000"
-```
-
-Two runs of 200000 iterations on the sample data set land on exactly what a single run
-of 400000 reaches — the same coefficients to the last bit, since nothing but the
-starting point distinguishes the second call from a continuation of the first:
-
-```text
-0      -> 200000  {"last_coefficients":[386.94817672821796,-210.66512190655385,764.9043122781602],"J_before_learning":1818750000.0,"J_after_learning":4516124.886161309}
-200000 -> 400000  {"last_coefficients":[385.6281263785745,-355.59201959840124,1418.405456447226],"J_before_learning":4516124.886161306,"J_after_learning":3767351.858096715}
-
-0      -> 400000  {"last_coefficients":[385.6281263785745,-355.59201959840124,1418.405456447226],"J_before_learning":1818750000.0,"J_after_learning":3767351.858096715}
-```
-
-The one thing this buys that a longer `loop_count` does not is a look at the cost
-part-way: each leg reports its own `J_before_learning` and `J_after_learning`, so a
-run that is drifting towards divergence shows it before the whole budget is spent.
-
 ## Layout
 
 ```text
@@ -293,6 +382,7 @@ src/
 ├── main.rs                               Router, body limit, CORS, server bootstrap
 ├── train_endpoint.rs                     The POST /train handler
 ├── train_params.rs                       Query parameters and their validation
+├── data_manipulate_client.rs             The hop out to data_manipulate_api
 ├── json_converter.rs                     JSON <-> the model's vectors, plus validation
 └── learning_without_feature_scaling.rs   The model: hypothesis, cost, gradients, descent
 ```
@@ -300,33 +390,44 @@ src/
 The layering is one-directional: the model knows nothing about JSON, and
 `json_converter` knows nothing about HTTP. `json_converter` validates the payload
 before the model's constructor is reached, so data arriving from outside can never
-trigger the panics that constructor documents. Its `n + 1` check on
-`initial_coefficients` is what earns that guarantee now the vector comes from the
-request rather than being built by the handler — the constructor panics on a
-coefficient vector of the wrong length, and this is the check that stops one reaching
-it.
+trigger the panics that constructor documents. The coefficient vector is no longer
+one of the things that could: the handler builds it as `vec![0.0; n + 1]` from a
+feature count validation has already pinned, so it cannot reach the constructor at
+the wrong length.
 
 ## Known limitations
 
 These are either deliberate or on the roadmap — listed so nobody has to rediscover
 them.
 
-- **A single-feature data set ignores `initial_coefficients`.** The handler replaces
-  the vector with zeros whenever its length is 2 (`train_endpoint.rs:35`). Validation
-  has already pinned the length to `n + 1` by that point, so the branch fires on
-  exactly one thing: `n == 1`. A one-feature model therefore always starts at the
-  origin, silently, whatever was sent — `initial_coefficients: [400.0, 1000.0]` on a
-  one-feature set answers with `J_before_learning` measured at `[0.0, 0.0]`. The
-  guard reads as though it were meant to catch an absent vector, but the field is
-  required, so it can never fire for that reason. Every `n >= 2` set is unaffected.
+- **`ratios` does not describe a column, so the mapping back is wrong.** The scaler
+  picks its exponent per value rather than per column, and reports only the first
+  sample's. A column of mixed magnitudes is therefore divided unevenly while `ratios`
+  claims a single exponent for it. On the sample data set the area column
+  `[55, 72, 90, 110, 130, 165]` comes back as `[5.5, 7.2, 9.0, 1.1, 1.3, 1.65]` — the
+  order reversed between rows 2 and 3 — and the descent fits that, ending on a
+  *negative* coefficient for area. Converting with `ratios` then predicts rows 0-2 to
+  within a percent and rows 3-5 out by 9-17%. Any column whose values all share a
+  digit count is unaffected; fixing the rest means scaling per column, which
+  `data_manipulate_api` deliberately does not do.
 - **No divergence guard.** If the learning rate is too large for the data's scale,
   the coefficients overflow to `NaN`. `serde_json` writes non-finite floats as
   `null`, so the endpoint answers `200 OK` with
-  `{"last_coefficients":[null,null,null], ...}` — `learning_rate=0.1` on the sample
-  data set above is already enough to trigger it. The range check on `learning_rate`
-  only rejects values that are not positive and finite; it cannot know what is too
-  large for a given data set. Compare `J_after_learning` against `J_before_learning`
-  to catch this until it is handled server-side.
+  `{"scaled_last_coefficients":[null,null,null], ...}` — `learning_rate=0.08` on the sample
+  data set is already enough, even after the scaling hop. The range check on
+  `learning_rate` only rejects values that are not positive and finite; it cannot
+  know what is too large for a given data set. Compare `J_after_learning` against
+  `J_before_learning` to catch this until it is handled server-side.
+- **Scaling only moves by powers of ten.** A column already below 10 keeps an
+  exponent of 0 and is passed through untouched, so it goes on driving the curvature
+  and setting the ceiling on `learning_rate`. On the sample data set the room count,
+  spanning 1 to 5, is what holds the ceiling near `0.05` — the hop cannot flatten a
+  valley it is not allowed to rescale.
+- **The chain costs a round trip and a second copy.** The whole payload crosses to
+  `data_manipulate_api` and the scaled version comes back, so a large data set is
+  held in memory twice over and travels the loopback interface once each way. The
+  32 MB body limit applies to what arrives here; nothing caps what the scaler
+  returns.
 - **Request bodies are capped at 32 MB** by the `DefaultBodyLimit` layer in
   `main.rs`, and going over does not surface as `413 Payload Too Large`. The limit
   makes the body stream fail part-way, and the multipart extractor reports that as a
