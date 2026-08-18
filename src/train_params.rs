@@ -21,7 +21,7 @@ pub struct TrainParams {
 fn default_learning_rate() -> f64 { 0.01 }
 fn default_loop_count() -> usize { 20_000 }
 
-const MAX_LOOP_COUNT: usize = 5_000_000;
+const MAX_LOOP_COUNT: usize = 1_000_000;
 
 impl TrainParams {
     pub fn validate(&self) -> Result<(), (StatusCode, String)> {

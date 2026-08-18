@@ -42,7 +42,7 @@ ENV BIND_ADDR=0.0.0.0:3000
 
 # Where the scaling hop goes. Compose overrides this with its service name; the
 # default assumes both processes share a network namespace.
-ENV DATA_MANIPULATE_URL=http://127.0.0.1:3001/manipulate-datas
+ENV DATA_MANIPULATE_URL=http://0.0.0.0:3001/manipulate-datas
 
 EXPOSE 3000
 

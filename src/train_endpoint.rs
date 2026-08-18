@@ -28,21 +28,11 @@ pub async fn train(
         "Form hasn't a 'dataset' named field !!".to_string(),
     ))?;
 
-    // Parsed here as well as by the scaler, because the checks this runs decide
-    // what the caller is told when the payload is malformed.
-    let (inputs, _outputs) = json_converter::training_data_from_json(&json_real_datas)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let n : usize = inputs[0].len();
-
-    // The descent always starts at the origin. A caller-supplied starting point
-    // would be expressed in the units of the data set they sent, which is not
-    // the space the descent runs in once the scaler has been through it, so
-    // there is nothing coherent for the payload to say here.
-    let initial_coefficients : Vec<f64> = vec![0.0; n + 1];
-
     // The hop that makes a sane learning rate possible: the descent runs on
     // single-digit columns instead of the caller's raw magnitudes.
     let scaled = data_manipulate_client::rescale(json_real_datas).await?;
+
+    let n = scaled.inputs[0].len();
 
     if scaled.ratios.len() != n + 1 {
         return Err((
@@ -55,7 +45,7 @@ pub async fn train(
     }
 
     let mut without_feature_scaling = WithoutFeatureScaling::new(
-        scaled.inputs, scaled.outputs, initial_coefficients
+        scaled.inputs, scaled.outputs, vec![0.0; n + 1]
     );
 
     let (scaled_coefficients, J_before_learning, J_after_learning) : (Vec<f64>, f64, f64)
