@@ -18,7 +18,7 @@ pub struct TrainParams {
 /// The ceiling is data-dependent — a column the scaler leaves alone, because it
 /// is already below 10, still drives the curvature — so these sit well under
 /// the point where the sample data set diverges rather than at it.
-fn default_learning_rate() -> f64 { 0.01 }
+fn default_learning_rate() -> f64 { 0.003 }
 fn default_loop_count() -> usize { 20_000 }
 
 const MAX_LOOP_COUNT: usize = 1_000_000;
