@@ -283,10 +283,10 @@ have to be edited.
 
 **Query parameters** — both optional, both checked before any training starts:
 
-| Parameter | Default | Accepted | Meaning |
-| --- | --- | --- | --- |
+| Parameter | Default | Accepted         | Meaning |
+| --- | --- |------------------| --- |
 | `learning_rate` | `0.01` | finite and `> 0` | Step size of each gradient descent update |
-| `loop_count` | `20000` | `1` to `5000000` | How many iterations to run |
+| `loop_count` | `20000` | `1` to `1000000` | How many iterations to run |
 
 The defaults are sized for the rescaled columns the descent runs on, not the raw
 payload. On the sample data set the ceiling before divergence sits near `0.05`, and
