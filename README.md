@@ -8,8 +8,9 @@ The model itself still does no scaling — "without feature scaling" in the modu
 name is literal, and the long narrow valley that unscaled features carve out is
 worth seeing. The scaling now happens one step earlier instead: `/train` hands the
 data set to `data_manipulate_api` first and trains on what comes back, which is
-what lets the learning rate be a sane number. See
-[The training chain](#the-training-chain).
+what lets the learning rate be a sane number. None of that reaches the caller: the
+coefficients are lifted back into the payload's own units before the reply leaves.
+See [The training chain](#the-training-chain).
 
 ## The math
 
@@ -41,38 +42,46 @@ being written back.
 ## The training chain
 
 `POST /train` does not train on the data set it is given. It forwards the payload
-to `data_manipulate_api`, which divides each column by a power of ten until it is
-single-digit, and the descent runs on that:
+to `data_manipulate_api`, which divides every column by the power of ten that makes
+its first value single-digit, and the descent runs on that:
 
 ```text
 Angular  ──POST /train──>  learn_model  ──POST /manipulate-datas──>  data_manipulate
                                 │                                          │
                                 │  <────── scaled columns + ratios ────────┘
                                 │
-                                └──> descent on scaled data ──> coefficients (scaled)
+                                ├──> descent on scaled data ──> coefficients (scaled)
+                                │
+                                └──> lifted back with ratios ──> coefficients (real)
 ```
 
 The point is the learning rate. On the sample data set below, raw magnitudes need
-`0.000003`, and a step even one order larger diverges. On the rescaled columns
-`0.05` is still stable and `0.01` is comfortable — roughly four orders of magnitude
-more room — and 5000 iterations reach a lower cost than a million did before.
+`0.000003`, and a step even one order larger diverges. On the rescaled columns the
+ceiling sits between `0.007` and `0.008` — three orders of magnitude more room — and
+20000 iterations reach a lower cost than a million did before.
 
-Coefficients come back **in the scaled space**, as `scaled_last_coefficients`, with
-`ratios` alongside them. Lifting them into the units the data set was written in is
-the caller's to do:
+Coefficients come back **in the units the data set was written in**. The descent
+still runs in the scaled space, but the handler lifts its result out before
+answering, with the `ratios` the scaler reported alongside the scaled columns:
 
 ```text
 a_j = a'_j * 10^(r_y - r_j)      b = b' * 10^r_y
 ```
 
+Both costs are measured the same way, against the unscaled samples, on a copy of the
+model that never trains — so `J_before_learning` and `J_after_learning` are readable
+against the magnitudes in the payload and not only against each other. `ratios` is
+not reported any more, because there is nothing left for the caller to do with it.
+
 There is no starting point to send. The descent always begins at the origin, because
 a caller-supplied one would be expressed in the units of the payload, which is not
 the space the descent runs in once the scaler has been through it.
 
-> **Caveat on the mapping.** The scaler picks its exponent per value, not per column,
-> so `ratios` describes only the first sample. On a column of mixed magnitudes the
-> conversion above is wrong for every row whose exponent differs from row 0's — see
-> [Known limitations](#known-limitations).
+> **Caveat on the exponent.** The scaler reads a column's exponent off that column's
+> *first* value and then divides the whole column by it. The conversion above is
+> therefore exact — every row of a column shares one exponent — but a column whose
+> first value is small next to the rest is barely scaled at all and goes on driving
+> the curvature. See [Known limitations](#known-limitations).
 
 The hop is the only way in for the scaler: nothing else needs to reach it, which is
 what [Keeping the pair private](#keeping-the-pair-private) relies on.
@@ -289,24 +298,32 @@ have to be edited.
 | `loop_count` | `20000` | `1` to `1000000` | How many iterations to run |
 
 The defaults are sized for the rescaled columns the descent runs on, not the raw
-payload. On the sample data set the ceiling before divergence sits near `0.05`, and
-the defaults stay under it with room to spare, because the ceiling is
-data-dependent: a column the scaler leaves alone, being already below 10, still
-drives the curvature. Measured on that data set:
+payload. On the sample data set the ceiling before divergence sits between `0.007`
+and `0.008`, and the default stays under it with room to spare, because the ceiling
+is data-dependent: a column the scaler barely moves — one already below 10, or one
+whose first value is small next to the rest — still drives the curvature. Anything
+above the default is expected to be data-dependent in exactly this way. Measured on
+that data set, against a live `data_manipulate_api`:
 
 | `learning_rate` | `loop_count` | `J_after_learning` |
 | --- | --- | --- |
-| `0.08` | 20000 | diverges — `null` coefficients |
-| `0.05` | 5000 | `0.0090` |
-| `0.01` | 20000 | `0.0093` |
-| `0.000003` | 1000000 | `0.0500` |
+| `0.008` | 20000 | `0` — diverged, `null` coefficients |
+| `0.007` | 20000 | `883121` |
+| `0.005` | 20000 | `883121` |
+| `0.003` (default) | 20000 | `883218` |
+| `0.003` (default) | 1000 | `2273972` |
+| `0.000003` | 1000000 | `2274468` |
 
-That last row is what this endpoint needed before the scaling hop existed.
+The costs are in the caller's own units now, so they are large where the data is
+large: `J_before_learning` on this set is `1818750000`, and the converged fit sits
+three orders of magnitude below it. That last row is what this endpoint needed before
+the scaling hop existed — the default now reaches a cost two and a half times lower
+with a thousand times the step and a fiftieth of the iterations.
 
 **Response** — `200 OK`, `Content-Type: application/json`, single-line:
 
 ```json
-{"J_before_learning":18.187500000000004,"J_after_learning":0.01820230981958408,"ratios":[1,0,4],"scaled_last_coefficients":[-0.05897920763610215,0.8597882776149124,1.7570875999268627]}
+{"J_before_learning":1818750000,"J_after_learning":883218,"last_coefficients":[245.86312190187883,2566.50059820144,7644.724306977841]}
 ```
 
 The handler returns `Json<TrainingResult>` rather than a `String`, which is what sets
@@ -314,15 +331,24 @@ that content type; error replies stay `text/plain`, as the table below describes
 
 | Field | Meaning |
 | --- | --- |
-| `J_before_learning` | Cost at the origin, where every run now starts. |
-| `J_after_learning` | Cost the run ended on. Comparing the two is the quickest way to tell whether the learning rate was sane. |
-| `ratios` | The exponent each column was divided by, one per feature with `outputs` last. |
-| `scaled_last_coefficients` | The fit, as `[a_1, ..., a_n, b]` with the bias last, so `n + 1` long. |
+| `J_before_learning` | Cost at the origin, where every run starts. A whole number — see below. |
+| `J_after_learning` | Cost the run ended on. Comparing the two is the quickest way to tell whether the learning rate was sane, with one exception: a diverged run reports `0`. |
+| `last_coefficients` | The fit, as `[a_1, ..., a_n, b]` with the bias last, so `n + 1` long. |
 
-Everything here is in the rescaled space the descent minimises over, so the numbers
-are comparable to each other but not to the magnitudes in the payload. Converting is
-the caller's job: `10^(r_y - r_j)` for a feature's coefficient, `10^r_y` for the bias,
-`10^(2 * r_y)` for a cost, with `r_y` the last entry of `ratios`.
+Everything here is in the units the data set was written in. The descent runs on the
+scaler's columns, but the handler lifts the coefficients back out with `ratios` and
+measures both costs against the unscaled samples, so there is nothing left to
+convert and nothing about the scaling hop shows up in the reply. The fit above reads
+as roughly `246` per square metre, `2567` per room and a base of `7645`.
+
+The two costs are `u128`, so they arrive as whole numbers: the mean squared error is
+summed in `f64` and truncated once, at the end. At the magnitudes a real data set
+produces that loses nothing worth having, but a cost below 1 reads as `0` — see
+[Known limitations](#known-limitations).
+
+`ratios` was part of this reply until the conversion moved server-side; a client that
+still reads it will find it gone, along with `scaled_last_coefficients`, which is now
+`last_coefficients` and no longer scaled.
 
 **Errors** — `4xx`/`5xx` with a plain-text body describing the problem:
 
@@ -333,7 +359,7 @@ the caller's job: `10^(r_y - r_j)` for a feature's coefficient, `10^r_y` for the
 | `400` | `Failed to deserialize query string: ...` | A query parameter is not of the expected type, e.g. `loop_count=abc` |
 | `400` | `learning_rate must be a finite number greater than 0, got X` | `learning_rate` is zero, negative, `NaN` or infinite |
 | `400` | `loop_count must be at least 1` | `loop_count` is `0` |
-| `400` | `loop_count must not exceed 5000000, got X` | `loop_count` is above the cap |
+| `400` | `loop_count must not exceed 1000000, got X` | `loop_count` is above the cap |
 | `400` | `invalid JSON payload: ...` | The field is not valid JSON, or does not match the expected shape |
 | `400` | `"inputs" is empty, there is nothing to train on` | `inputs` is `[]` |
 | `400` | `sample count mismatch: N input sample(s) but M output(s)` | `inputs` and `outputs` differ in length |
@@ -366,7 +392,7 @@ Override either hyperparameter from the query string. Quote the URL, otherwise t
 shell swallows everything from the `&` onwards:
 
 ```bash
-curl -X POST -F "dataset=@dataset.json" "http://localhost:3000/train?learning_rate=0.05&loop_count=5000"
+curl -X POST -F "dataset=@dataset.json" "http://localhost:3000/train?learning_rate=0.005&loop_count=5000"
 ```
 
 Pretty-print the response by piping through `jq`:
@@ -391,43 +417,70 @@ The layering is one-directional: the model knows nothing about JSON, and
 `json_converter` knows nothing about HTTP. `json_converter` validates the payload
 before the model's constructor is reached, so data arriving from outside can never
 trigger the panics that constructor documents. The coefficient vector is no longer
-one of the things that could: the handler builds it as `vec![0.0; n + 1]` from a
-feature count validation has already pinned, so it cannot reach the constructor at
-the wrong length.
+one of the things that could: the handler builds it as `vec![0.0; n + 1]` from the
+feature count the scaler reported, which is checked against the length of `ratios`
+first, so it cannot reach the constructor at the wrong length.
+
+The handler is the only place that sees both spaces at once. It builds three models
+around a single descent — one on the unscaled data at the origin for the cost
+before, one on the scaled data that actually trains, one on the unscaled data
+holding the converted coefficients for the cost after — which is why the model's
+`coefficients` field is public: it is how the starting point is carried from the
+first to the second.
 
 ## Known limitations
 
 These are either deliberate or on the roadmap — listed so nobody has to rediscover
 them.
 
-- **`ratios` does not describe a column, so the mapping back is wrong.** The scaler
-  picks its exponent per value rather than per column, and reports only the first
-  sample's. A column of mixed magnitudes is therefore divided unevenly while `ratios`
-  claims a single exponent for it. On the sample data set the area column
-  `[55, 72, 90, 110, 130, 165]` comes back as `[5.5, 7.2, 9.0, 1.1, 1.3, 1.65]` — the
-  order reversed between rows 2 and 3 — and the descent fits that, ending on a
-  *negative* coefficient for area. Converting with `ratios` then predicts rows 0-2 to
-  within a percent and rows 3-5 out by 9-17%. Any column whose values all share a
-  digit count is unaffected; fixing the rest means scaling per column, which
-  `data_manipulate_api` deliberately does not do.
+- **A column's exponent is read off its first row.** `data_manipulate_api` takes the
+  power of ten from each column's first value and divides the whole column by it, so
+  the mapping back is exact — but how well a column is conditioned depends on which
+  row happens to be first. The sample data set's area column
+  `[55, 72, 90, 110, 130, 165]` comes back as `[5.5, ..., 16.5]`, still spanning a
+  factor of three and still over 10 at the top, and that is what holds the
+  learning-rate ceiling below `0.008`. A column whose first value is small next to
+  the rest is scaled least where it would help most.
 - **No divergence guard.** If the learning rate is too large for the data's scale,
   the coefficients overflow to `NaN`. `serde_json` writes non-finite floats as
   `null`, so the endpoint answers `200 OK` with
-  `{"scaled_last_coefficients":[null,null,null], ...}` — `learning_rate=0.08` on the sample
+  `{"last_coefficients":[null,null,null], ...}` — `learning_rate=0.008` on the sample
   data set is already enough, even after the scaling hop. The range check on
   `learning_rate` only rejects values that are not positive and finite; it cannot
-  know what is too large for a given data set. Compare `J_after_learning` against
-  `J_before_learning` to catch this until it is handled server-side.
+  know what is too large for a given data set. The costs will not give it away
+  either: `J_after_learning` is a `u128` and `NaN as u128` is `0`, so a run that
+  blew up reports the lowest cost there is, right next to a `J_before_learning` of
+  nine figures. The `null` coefficients are the signal to check until this is
+  handled server-side.
+- **The costs are whole numbers.** `J` returns `u128`, so the mean squared error
+  arrives truncated and anything below 1 reads as `0`. It is summed in `f64` and cast
+  once at the end, which is what keeps the sign of each residual intact — casting
+  them one by one would saturate every negative one to zero and quietly drop the
+  samples the model under-estimates. On a data set whose outputs are small, though,
+  a `0` here means "under one", not "exact".
 - **Scaling only moves by powers of ten.** A column already below 10 keeps an
-  exponent of 0 and is passed through untouched, so it goes on driving the curvature
-  and setting the ceiling on `learning_rate`. On the sample data set the room count,
-  spanning 1 to 5, is what holds the ceiling near `0.05` — the hop cannot flatten a
-  valley it is not allowed to rescale.
-- **The chain costs a round trip and a second copy.** The whole payload crosses to
-  `data_manipulate_api` and the scaled version comes back, so a large data set is
-  held in memory twice over and travels the loopback interface once each way. The
-  32 MB body limit applies to what arrives here; nothing caps what the scaler
-  returns.
+  exponent of 0 and is passed through untouched — the room count on the sample data
+  set, spanning 1 to 5, is one such column. The hop cannot flatten a valley it is not
+  allowed to rescale, so what is left of the valley after scaling is what sets the
+  ceiling on `learning_rate`. On this data set that is the area column rather than
+  the room count: at `[5.5, ..., 16.5]` it still carries an order of magnitude more
+  curvature than the rooms do.
+- **The chain costs a round trip and three copies.** The whole payload crosses to
+  `data_manipulate_api` and the scaled version comes back, and the handler then
+  parses the raw JSON a second time locally, because the costs are measured against
+  the caller's own numbers. A large data set is therefore held as the raw text, the
+  scaled vectors and the unscaled vectors at once, and travels the loopback interface
+  once each way. The 32 MB body limit applies to what arrives here; nothing caps what
+  the scaler returns.
+- **The payload's validation effectively happens in the other service.**
+  `json_converter` still runs here, but after the hop, and its result is `unwrap()`ed.
+  Everything it would reject — an empty set, a sample-count mismatch, a ragged row —
+  `data_manipulate_api` has already answered `400` for, and that status is passed
+  straight through, so the `unwrap()` is unreachable in practice. What keeps it
+  unreachable is the two services agreeing on those checks, and nothing in this
+  repository enforces the agreement. Parsing before the hop would make this service's
+  own error the one the caller sees and would save a round trip on data that was
+  never usable.
 - **Request bodies are capped at 32 MB** by the `DefaultBodyLimit` layer in
   `main.rs`, and going over does not surface as `413 Payload Too Large`. The limit
   makes the body stream fail part-way, and the multipart extractor reports that as a

@@ -14,7 +14,7 @@
 //! and the result of a training run is written back as:
 //!
 //! ```json
-//! { "scaled_last_coefficients": [375.13, -195.00, 1807.28] }
+//! { "last_coefficients": [375.13, -195.00, 1807.28] }
 //! ```
 //!
 //! Nothing in this crate's `main` calls into this module — it exists to be
@@ -43,17 +43,35 @@ pub struct TrainingData {
 
 /// The outcome of a training run.
 ///
-/// Everything here is in the rescaled space the descent runs in. Mapping back
-/// to the units the data set was in before scaling is the caller's to do, from
-/// [`Self::ratios`].
+/// Everything here is in the units the data set was written in, not the
+/// rescaled space the descent actually ran in: the costs are measured against
+/// the unscaled samples and the coefficients are converted back before they
+/// reach this struct, so nothing about the scaling hop is left for the caller
+/// to undo. The `ratios` that used to travel alongside them for exactly that
+/// purpose are gone with it.
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrainingResult {
-    /// The cost before and after the run, measured in the rescaled space the
-    /// descent actually minimises over.
-    pub J_before_learning : f64,
-    pub J_after_learning : f64,
+    /// The cost at the origin and the cost the run ended on, both measured on
+    /// the unscaled data set, so they are readable against the magnitudes in
+    /// the payload rather than only against each other. An `after` that is not
+    /// well below the `before` is the quickest sign that the learning rate was
+    /// wrong for the data.
+    ///
+    /// Whole numbers: the mean squared error is summed as `f64` and truncated
+    /// on the way out, which costs nothing at the magnitudes a real data set
+    /// produces but reads as `0` for any fit whose cost falls below 1. A run
+    /// that diverged also reports `0`, because the residuals are `NaN` by then
+    /// — [`Self::last_coefficients`] comes back `null` and is the signal that
+    /// can be trusted.
+    pub J_before_learning : u128,
+    pub J_after_learning : u128,
 
-    /// Comment should edit <----
+    /// The fit the descent converged to, as `[a_1, ..., a_n, b]` with the bias
+    /// in the last slot, so the vector is `n + 1` long. Already lifted out of
+    /// the scaled space by `train_endpoint::convert_to_real_coefficients`,
+    /// which is what makes these coefficients applicable to the data set as it
+    /// was sent.
     pub last_coefficients : Vec<f64>,
 }
 

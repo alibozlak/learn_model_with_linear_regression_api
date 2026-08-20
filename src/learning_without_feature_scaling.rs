@@ -16,8 +16,11 @@
 /// Since the features keep their original ranges (square meters in the tens or
 /// hundreds versus a room count in single digits), the cost surface is a long
 /// and narrow valley: gradient descent only stays stable with a very small
-/// learning rate and needs many iterations. The run log at the end of
-/// `main.rs` shows that behaviour.
+/// learning rate and needs many iterations. Nothing here does anything about
+/// that: a caller is free to hand the constructor columns that have already
+/// been divided down — which is what `train_endpoint` does — but this model
+/// cannot tell such a data set apart from a raw one, and reports every number
+/// in whichever space it was given.
 pub struct WithoutFeatureScaling {
 
     /// Training inputs: `m` samples of `n` features each, so `real_inputs[i][j]`
@@ -36,6 +39,14 @@ pub struct WithoutFeatureScaling {
 
     /// The parameters being learned, laid out as `[a_1, ..., a_n, b]`. The last
     /// slot (index `n`) is the bias `b`, which is why the length is `n + 1`.
+    ///
+    /// Public so that a starting point can be carried from one model to the
+    /// next: `train_endpoint` reads the cost at the origin off a model built on
+    /// the unscaled data and then hands these same coefficients to the model
+    /// that runs the descent on the scaled data. It is the one field that
+    /// escapes [`Self::validate_data_set`] — assigning a vector of any length
+    /// other than `n + 1` leaves the struct in the state that check exists to
+    /// reject, and the next prediction indexes out of bounds.
     pub coefficients : Vec<f64>
 }
 
@@ -65,6 +76,11 @@ impl WithoutFeatureScaling {
     /// Runs batch gradient descent for `loop_count` iterations and returns the
     /// coefficients reached at the end.
     ///
+    /// Reading the cost is the caller's: [`Self::J`] answers it at any point,
+    /// and the two readings a run is judged by are not necessarily taken here
+    /// at all — `train_endpoint` takes both of them on the unscaled data set,
+    /// against a copy of the model that never trains.
+    ///
     /// Each iteration updates every parameter once:
     ///
     /// ```text
@@ -82,20 +98,24 @@ impl WithoutFeatureScaling {
     /// same, still unchanged coefficients. Writing in place would make the
     /// derivative of `a_2` already see the updated `a_1`, which is a different
     /// algorithm. The step only takes effect once the whole iteration is done.
+    ///
+    /// The two vectors then trade places rather than one being copied over the
+    /// other. Every slot of `temp_coefficients` is written before it is read
+    /// again, so what the swap leaves behind — the iteration's old
+    /// coefficients — is scratch space either way, and the step costs two
+    /// pointer moves instead of `n + 1` float copies.
     pub fn train_model(&mut self, learning_rate : f64, loop_count : usize) -> Vec<f64>
     {
-        // FixMe : Loop
         let mut temp_coefficients  = vec![0.0; self.n + 1];
-        for i in 0..loop_count {
+        for _ in 0..loop_count {
             for j in 0..self.n {
                 temp_coefficients[j] = self.coefficients[j] - learning_rate * self.dJ_daj(j);
             }
 
             temp_coefficients[self.n] = self.coefficients[self.n] - learning_rate * self.dJ_db();
 
-            for j in 0..(self.n + 1) {
-                self.coefficients[j] = temp_coefficients[j];
-            }
+            //In Java System.arraycopy(..., ...) or THIS (better than other) :
+            std::mem::swap(&mut self.coefficients, &mut temp_coefficients);
         }
 
         self.coefficients.clone()
@@ -111,6 +131,7 @@ impl WithoutFeatureScaling {
     /// fixed. `f(i) - y^(i)` is the signed error of a prediction; multiplying it
     /// by the feature value weights each sample by how much that feature
     /// contributed to the error.
+    #[allow(non_snake_case)]
     fn dJ_daj(&self, j : usize) -> f64 {
         let mut result : f64 = 0.0;
         for i in 0..self.m {
@@ -128,10 +149,11 @@ impl WithoutFeatureScaling {
     ///
     /// Same shape as [`Self::dJ_daj`] without the feature factor, because `b`
     /// is added to every prediction with a constant weight of 1.
+    #[allow(non_snake_case)]
     fn dJ_db(&self) -> f64 {
         let mut result : f64 = 0.0;
         for i in 0..self.m {
-            result += (self.f(i) - self.real_outputs[i]);
+            result += self.f(i) - self.real_outputs[i];
         }
 
         result * 2. / (self.m as f64)
@@ -147,13 +169,27 @@ impl WithoutFeatureScaling {
     /// There is no 1/2 factor in front of the mean, which is why the two
     /// derivatives above keep their factor of 2. Squaring makes over- and
     /// under-estimates count the same and punishes large errors harder.
-    pub fn J(&self) -> f64 {
+    ///
+    /// The sum is accumulated in `f64` and only the finished mean is cast to
+    /// `u128`. That order is the whole point: `f64 as u128` saturates, so
+    /// casting a residual before squaring it would turn every negative one into
+    /// a zero and drop the samples the model under-estimates out of the cost
+    /// altogether.
+    ///
+    /// The cast truncates, so what comes back is the whole part of the cost and
+    /// a data set small enough for its mean squared error to fall below 1 reads
+    /// as `0`. A diverged run reads as `0` too, for an unrelated reason: the
+    /// coefficients are `NaN` by then and `NaN as u128` is `0`. This number
+    /// therefore cannot tell a perfect fit from a broken one — the coefficients
+    /// can, by coming back `NaN`.
+    #[allow(non_snake_case)]
+    pub fn J(&self) -> u128 {
         let mut result : f64 = 0.0;
         for i in 0..self.m {
             result += (self.f(i) - self.real_outputs[i]).powi(2);
         }
 
-        result / (self.m as f64)
+        (result / (self.m as f64)) as u128
     }
 
     /// The model's prediction for the sample stored at index `m`.
