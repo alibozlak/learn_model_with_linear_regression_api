@@ -10,9 +10,9 @@ use crate::learning_without_feature_scaling::WithoutFeatureScaling;
 /// data set was written in.
 ///
 /// The hop out to `data_manipulate_api` is what makes a sane learning rate
-/// possible — the descent runs on single-digit columns instead of the caller's
-/// raw magnitudes — but none of it should be visible in the reply any more, so
-/// the handler undoes the scaling on the way back out:
+/// possible — the descent runs on columns the scaler has divided down instead
+/// of the caller's raw magnitudes — but none of it should be visible in the
+/// reply any more, so the handler undoes the scaling on the way back out:
 ///
 /// * the payload is parsed a second time here, unscaled, because both costs are
 ///   measured against the numbers the caller actually sent. The scaler only
@@ -112,10 +112,13 @@ pub async fn train(
 /// its own, and reading its exponent out of the slot at index `n` would pair
 /// `r_y` with itself and leave the bias multiplied by `10^0`.
 ///
-/// The conversion is only as honest as `ratios` is. The scaler picks its
-/// exponent per value rather than per column and reports the first sample's, so
-/// a column of mixed magnitudes is lifted by an exponent that describes row 0
-/// alone — see "Known limitations" in the README.
+/// The exponent is per column, which is what makes the conversion exact: the
+/// scaler reads a column's power of ten off that column's first value and then
+/// divides every row of it by the same amount, so one exponent really does
+/// describe the whole column. What the first-row rule costs is conditioning
+/// rather than accuracy — a column whose first value is small next to the rest
+/// comes back barely scaled — and that is the descent's problem, not this
+/// function's. See "Known limitations" in the README.
 pub fn convert_to_real_coefficients(ratios : Vec<usize>, scaled_coefficients : Vec<f64>) -> Vec<f64> {
     let n = ratios.len() - 1;
     let mut real_last_coefficients : Vec<f64> = vec![0.0; n + 1];

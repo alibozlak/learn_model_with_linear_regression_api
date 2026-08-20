@@ -11,15 +11,25 @@
 //! }
 //! ```
 //!
-//! and the result of a training run is written back as:
+//! and the result of a training run is written back in this shape. The numbers
+//! below are the ones the README's sample data set converges to under the
+//! default parameters:
 //!
 //! ```json
-//! { "last_coefficients": [375.13, -195.00, 1807.28] }
+//! {
+//!   "J_before_learning": 1818750000,
+//!   "J_after_learning":  883218,
+//!   "last_coefficients": [
+//!     245.86312190187883, 2566.50059820144, 7644.724306977841
+//!   ]
+//! }
 //! ```
 //!
-//! Nothing in this crate's `main` calls into this module — it exists to be
-//! consumed from outside, so its items are exempted from the dead-code warning
-//! a binary target would otherwise raise for them.
+//! `train_endpoint` reaches in here for [`training_data_from_json`], which is
+//! how the handler gets hold of the unscaled vectors it measures both costs
+//! against. The two serialisers are the part with no caller inside this binary
+//! — they exist to be consumed from outside, and they are what the dead-code
+//! exemption below is for.
 #![allow(dead_code)]
 
 use std::error::Error;

@@ -147,6 +147,11 @@ How it is put together, and why:
   loopback is unreachable even from its own host. Remapping from the host is still
   the simpler way to move the port: `-p 127.0.0.1:8080:3000`. Keep the `127.0.0.1:`
   prefix — see [Keeping the pair private](#keeping-the-pair-private).
+- **The scaler's address comes from `DATA_MANIPULATE_URL`**, which the image also
+  sets, to `http://0.0.0.0:3001/manipulate-datas`. That default only reaches anything
+  if the scaler shares the container's network namespace, so a stack of separate
+  containers has to override it — with the scaler's service name under compose, or
+  with the `-e` in the `docker run` above.
 
 `.dockerignore` keeps `target/` out of the build context. It grows to a few hundred
 megabytes as soon as the project is built locally, and every byte would otherwise be
@@ -159,7 +164,7 @@ All optional, all read once at startup:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `BIND_ADDR` | `127.0.0.1:3000` | Where the server listens. Loopback keeps it off the network; a container has to override it to `0.0.0.0:3000` or nothing reaches it, even from its own host. |
-| `DATA_MANIPULATE_URL` | `http://127.0.0.1:3001/manipulate-datas` | The scaler's endpoint. A compose stack points this at the scaler's service name. |
+| `DATA_MANIPULATE_URL` | `http://127.0.0.1:3001/manipulate-datas` | The scaler's endpoint. That default is the binary's; the image ships its own, `http://0.0.0.0:3001/manipulate-datas`, which assumes the scaler shares the container's network namespace. A compose stack points this at the scaler's service name instead. |
 | `ALLOWED_ORIGINS` | `http://localhost:4200` | Comma-separated origins the browser may read a reply from — see [CORS](#cors). |
 
 ## Keeping the pair private
@@ -360,10 +365,6 @@ still reads it will find it gone, along with `scaled_last_coefficients`, which i
 | `400` | `learning_rate must be a finite number greater than 0, got X` | `learning_rate` is zero, negative, `NaN` or infinite |
 | `400` | `loop_count must be at least 1` | `loop_count` is `0` |
 | `400` | `loop_count must not exceed 1000000, got X` | `loop_count` is above the cap |
-| `400` | `invalid JSON payload: ...` | The field is not valid JSON, or does not match the expected shape |
-| `400` | `"inputs" is empty, there is nothing to train on` | `inputs` is `[]` |
-| `400` | `sample count mismatch: N input sample(s) but M output(s)` | `inputs` and `outputs` differ in length |
-| `400` | `sample K has F feature(s) while the first sample has E` | Rows of differing width |
 | `400` | ``Error parsing `multipart/form-data` request`` | The multipart body is malformed, or the request went over the 32 MB body limit |
 | `4xx` | `the scaling service rejected the data set: ...` | `data_manipulate_api` refused the payload; its status and message are passed through, since the data it refused is the caller's |
 | `502` | `could not reach the scaling service at URL: ...` | `data_manipulate_api` is down or the URL is wrong — see [Configuration](#configuration) |
@@ -371,6 +372,20 @@ still reads it will find it gone, along with `scaled_last_coefficients`, which i
 | `502` | `could not parse the scaling service's reply: ...` | Its reply was not the expected JSON |
 | `502` | `the scaling service returned N ratios for M feature(s), expected ...` | The scaled data does not match the payload's shape |
 | `500` | serialisation error | The result could not be encoded |
+
+Whether the payload describes a usable training set is decided by
+`data_manipulate_api`, which sees the data before this service parses it, so those
+four failures arrive wrapped in its rejection line rather than on their own:
+
+```text
+the scaling service rejected the data set: invalid JSON payload: ...
+the scaling service rejected the data set: "inputs" is empty, there is nothing to train on
+the scaling service rejected the data set: sample count mismatch: N input sample(s) but M output(s)
+the scaling service rejected the data set: sample K has F feature(s) while the first sample has E
+```
+
+`json_converter` here produces the same four messages, but never gets to answer with
+them — see [Known limitations](#known-limitations).
 
 ## Usage with curl
 
