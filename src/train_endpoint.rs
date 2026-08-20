@@ -30,7 +30,7 @@ pub async fn train(
 
     // The hop that makes a sane learning rate possible: the descent runs on
     // single-digit columns instead of the caller's raw magnitudes.
-    let scaled = data_manipulate_client::rescale(json_real_datas).await?;
+    let scaled = data_manipulate_client::rescale(json_real_datas.clone()).await?;
 
     let n = scaled.inputs[0].len();
 
@@ -44,12 +44,27 @@ pub async fn train(
         ));
     }
 
+    let initial_coefficients : Vec<f64> = vec![0.0; n + 1];
+    let (non_scaled_inputs, non_scaled_outputs) : (Vec<Vec<f64>>, Vec<f64>)
+        = json_converter::training_data_from_json(&json_real_datas).unwrap();
+
     let mut without_feature_scaling = WithoutFeatureScaling::new(
-        scaled.inputs, scaled.outputs, vec![0.0; n + 1]
+        non_scaled_inputs.clone(), non_scaled_outputs.clone(), initial_coefficients
+    );
+    let J_before_learning : f64 = without_feature_scaling.J();
+
+    without_feature_scaling = WithoutFeatureScaling::new(
+        scaled.inputs, scaled.outputs, without_feature_scaling.coefficients
     );
 
-    let (scaled_coefficients, J_before_learning, J_after_learning) : (Vec<f64>, f64, f64)
+    let scaled_coefficients : Vec<f64>
         = without_feature_scaling.train_model(params.learning_rate, params.loop_count);
+    let real_last_coefficients : Vec<f64> = convert_to_real_coefficients(scaled.ratios, scaled_coefficients);
+
+    without_feature_scaling = WithoutFeatureScaling::new(
+        non_scaled_inputs, non_scaled_outputs, real_last_coefficients.clone()
+    );
+    let J_after_learning : f64 = without_feature_scaling.J();
 
     // Everything is reported in the scaled space the descent ran in. `ratios`
     // travels with it so the caller can lift the coefficients back into the
@@ -57,7 +72,16 @@ pub async fn train(
     Ok(Json(TrainingResult {
         J_before_learning,
         J_after_learning,
-        ratios : scaled.ratios,
-        scaled_last_coefficients : scaled_coefficients
+        last_coefficients : real_last_coefficients
     }))
+}
+
+pub fn convert_to_real_coefficients(ratios : Vec<usize>, scaled_coefficients : Vec<f64>) -> Vec<f64> {
+    let n = ratios.len() - 1;
+    let mut real_last_coefficients : Vec<f64> = vec![0.0; n];
+    for i in 0..(n+1) {
+        real_last_coefficients[i]
+            = scaled_coefficients[i] * 10.0_f64.powi(ratios[n+1] as i32 - ratios[i] as i32);
+    }
+    real_last_coefficients
 }

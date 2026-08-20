@@ -36,7 +36,7 @@ pub struct WithoutFeatureScaling {
 
     /// The parameters being learned, laid out as `[a_1, ..., a_n, b]`. The last
     /// slot (index `n`) is the bias `b`, which is why the length is `n + 1`.
-    coefficients : Vec<f64>
+    pub coefficients : Vec<f64>
 }
 
 impl WithoutFeatureScaling {
@@ -82,11 +82,8 @@ impl WithoutFeatureScaling {
     /// same, still unchanged coefficients. Writing in place would make the
     /// derivative of `a_2` already see the updated `a_1`, which is a different
     /// algorithm. The step only takes effect once the whole iteration is done.
-    pub fn train_model(&mut self, learning_rate : f64, loop_count : usize)
-        -> (Vec<f64>, f64, f64)
+    pub fn train_model(&mut self, learning_rate : f64, loop_count : usize) -> Vec<f64>
     {
-        let J_before_learning : f64 = self.J();
-
         // FixMe : Loop
         let mut temp_coefficients  = vec![0.0; self.n + 1];
         for i in 0..loop_count {
@@ -101,9 +98,7 @@ impl WithoutFeatureScaling {
             }
         }
 
-        let J_after_learning : f64 = self.J();
-
-        (self.coefficients.clone(), J_before_learning, J_after_learning)
+        self.coefficients.clone()
     }
 
     /// Partial derivative of the cost with respect to the `j`-th weight `a_j`:

@@ -53,13 +53,8 @@ pub struct TrainingResult {
     pub J_before_learning : f64,
     pub J_after_learning : f64,
 
-    /// The power of ten each column was divided by, one per feature with the
-    /// exponent for `outputs` last, as `data_manipulate_api` reported it.
-    pub ratios : Vec<usize>,
-
-    /// The coefficients the descent ended on, the bias `b` in the last slot,
-    /// so the vector is `n + 1` long.
-    pub scaled_last_coefficients : Vec<f64>,
+    /// Comment should edit <----
+    pub last_coefficients : Vec<f64>,
 }
 
 /// Everything that can go wrong while converting between JSON and the model's
